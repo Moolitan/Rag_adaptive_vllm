@@ -1,0 +1,11 @@
+{
+  "python_version": "3.11",
+  "dependencies": ["."],
+  "graphs": {
+    "hop2rag": "./studio.py:hop2rag",
+    "crag": "./studio.py:crag",
+    "agrag": "./studio.py:agrag",
+    "selfrag": "./studio.py:selfrag"
+  },
+  "env": ".env"
+}

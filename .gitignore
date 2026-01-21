@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+!.env.example
+
+Agrag/log/*.log
+Agrag/data/hotpotqa/
+Agrag/data/wiki/
+Agrag/Ai_coding.sh
+Agrag/tests/results/*.jsonl
+Agrag/tests/results/*.json
+Agrag/.langgraph_api/
+Agrag/tests/results/
+vllm/
