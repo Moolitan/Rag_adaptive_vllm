@@ -964,7 +964,15 @@ def run_hop2_rag(
         max_hops: 最大跳数
 
     Returns:
-        包含 final_answer, supporting_facts 和 metadata 的字典
+        包含完整调试信息的字典:
+        - answer: 最终答案
+        - supporting_facts: 支撑事实
+        - metadata: 元数据
+        - documents: 最终使用的文档
+        - hop_evidence: 每跳提取的证据
+        - intermediate_answers: 每跳的中间答案
+        - hop_documents: 每跳检索的文档列表
+        - timing_ms: 总耗时
     """
     app = get_hop2_rag_app()
 
@@ -992,11 +1000,17 @@ def run_hop2_rag(
     }
     _tracker.log_request(record)
 
+    # 返回完整的调试信息
     return {
         "answer": result.get("final_answer", ""),
         "supporting_facts": result.get("supporting_facts", []),
         "metadata": result.get("metadata", {}),
         "documents": result.get("documents", []),
+        # 新增: 调试信息
+        "hop_evidence": result.get("hop_evidence", []),
+        "intermediate_answers": result.get("intermediate_answers", []),
+        "hop_documents": result.get("hop_documents", []),
+        "hop_queries": result.get("metadata", {}).get("hop_queries", []),
         "timing_ms": total_ms
     }
 

@@ -1,11 +1,16 @@
 {
+  "_comment": "LangGraph Studio 配置文件 - 定义可用的工作流图",
+
   "python_version": "3.11",
+
   "dependencies": ["."],
+
   "graphs": {
     "hop2rag": "./studio.py:hop2rag",
     "crag": "./studio.py:crag",
     "agrag": "./studio.py:agrag",
     "selfrag": "./studio.py:selfrag"
   },
+
   "env": ".env"
 }

@@ -11,10 +11,24 @@ python -m vllm.entrypoints.openai.api_server \
     --port 8000
 
 export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_hotpotqa_fullwiki"                                                
-export AGRAG_COLLECTION_NAME="hotpot_fullwiki"   
+export AGRAG_COLLECTION_NAME="hotpotqa_fullwiki"   
 
 python tests/rag_system/Hop2rag/test_hop2rag_latency.py \
-        --limit 30 \
-        --k 10 \
-        --max-hops 3 \
+        --limit 100 \
+        --k 20 \
+        --max-hops 10 \
         --enable-instrumentation
+
+# 检查库是否有数据
+python - << 'PY'
+import os, chromadb
+persist = os.environ["AGRAG_PERSIST_DIR"]
+client = chromadb.PersistentClient(path=persist)
+
+for name in ["hotpot_fullwiki", "hotpotqa_fullwiki", "rag-chroma"]:
+    try:
+        col = client.get_collection(name)
+        print(name, "count=", col.count())
+    except Exception as e:
+        print(name, "ERROR", e)
+PY

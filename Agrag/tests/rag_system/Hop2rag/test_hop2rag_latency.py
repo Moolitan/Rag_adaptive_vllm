@@ -239,12 +239,39 @@ class RequestTrace:
     # Result
     success: bool = True
     error: str = ""
+    answer: str = ""            # 最终生成的答案
+
+    # ===== 调试信息(新增) =====
+    # 每跳的证据/线索
+    hop_evidence: List[str] = None
+    # 中间答案摘要
+    intermediate_answers: List[str] = None
+    # Supporting Facts (HotpotQA格式)
+    supporting_facts: List = None
+    # 完整元数据
+    metadata: Dict[str, Any] = None
+    # 每跳检索到的文档内容(可选，调试用)
+    hop_documents_content: List[List[str]] = None
+    # 最终使用的文档内容
+    final_documents_content: List[str] = None
 
     def __post_init__(self):
         if self.hop_queries is None:
             self.hop_queries = []
         if self.hop_docs_per_hop is None:
             self.hop_docs_per_hop = []
+        if self.hop_evidence is None:
+            self.hop_evidence = []
+        if self.intermediate_answers is None:
+            self.intermediate_answers = []
+        if self.supporting_facts is None:
+            self.supporting_facts = []
+        if self.metadata is None:
+            self.metadata = {}
+        if self.hop_documents_content is None:
+            self.hop_documents_content = []
+        if self.final_documents_content is None:
+            self.final_documents_content = []
 
 
 class SystemBenchmark:
@@ -302,6 +329,35 @@ class SystemBenchmark:
             all_docs = result.get("documents", [])
             answer = result.get("answer", "")
 
+            # ===== 新增: 提取调试信息 =====
+            trace.answer = answer
+            trace.supporting_facts = result.get("supporting_facts", [])
+            trace.metadata = metadata
+
+            # 从metadata提取每跳的证据和中间答案
+            # 注意: 这些字段需要在 hop2_rag.py 的 run_hop2_rag 返回值中包含
+            trace.hop_evidence = result.get("hop_evidence", [])
+            trace.intermediate_answers = result.get("intermediate_answers", [])
+
+            # 提取最终使用的文档内容(截断以避免过大)
+            trace.final_documents_content = []
+            for doc in all_docs[:10]:  # 最多10篇
+                content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+                trace.final_documents_content.append(content[:500])  # 截断到500字符
+
+            # 提取每跳的文档数量
+            hop_documents = result.get("hop_documents", [])
+            trace.hop_docs_per_hop = [len(docs) for docs in hop_documents] if hop_documents else []
+
+            # 提取每跳的文档内容(可选，用于深度调试)
+            trace.hop_documents_content = []
+            for hop_docs in hop_documents[:5]:  # 最多5跳
+                hop_content = []
+                for doc in hop_docs[:3]:  # 每跳最多3篇
+                    content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+                    hop_content.append(content[:300])  # 截断到300字符
+                trace.hop_documents_content.append(hop_content)
+
             # Check if result contains LLM usage stats
             usage = result.get("usage", {})
             if usage and "prompt_tokens" in usage:
@@ -337,9 +393,23 @@ class SystemBenchmark:
 
         return trace
 
-    def run_serial(self, questions: List[tuple], verbose: bool = True) -> List[RequestTrace]:
-        """Run requests serially (concurrency=1)"""
+    def run_serial(self, questions: List[tuple], verbose: bool = True,
+                   trace_file: str = None) -> List[RequestTrace]:
+        """
+        Run requests serially (concurrency=1)
+
+        Args:
+            questions: 问题列表 [(req_id, question), ...]
+            verbose: 是否打印详细信息
+            trace_file: 如果指定，每完成一个请求就流式写入该文件(JSONL格式)
+        """
         traces = []
+
+        # 如果指定了trace_file，清空并准备写入
+        if trace_file:
+            Path(trace_file).parent.mkdir(parents=True, exist_ok=True)
+            # 清空文件
+            open(trace_file, 'w').close()
 
         for i, (req_id, question) in enumerate(questions):
             if verbose:
@@ -349,14 +419,35 @@ class SystemBenchmark:
             trace = self.run_single_request(req_id, question, submit_time)
             traces.append(trace)
 
+            # 流式写入: 每完成一个请求立即追加到文件
+            if trace_file:
+                append_trace_jsonl(trace, trace_file)
+
             if verbose:
-                print(f"  ✓ Latency: {trace.e2e_latency:.2f}s, Hops: {trace.num_hops}, Tokens: {trace.prompt_tokens} ({trace.token_source})")
+                status = "✓" if trace.success else "✗"
+                print(f"  {status} Latency: {trace.e2e_latency:.2f}s, Hops: {trace.num_hops}, "
+                      f"Answer: {trace.answer[:50]}..." if trace.answer else "")
 
         return traces
 
-    def run_concurrent(self, questions: List[tuple], max_workers: int, verbose: bool = True) -> List[RequestTrace]:
-        """Run requests with controlled concurrency"""
+    def run_concurrent(self, questions: List[tuple], max_workers: int, verbose: bool = True,
+                       trace_file: str = None) -> List[RequestTrace]:
+        """
+        Run requests with controlled concurrency
+
+        Args:
+            questions: 问题列表
+            max_workers: 并发数
+            verbose: 是否打印详细信息
+            trace_file: 如果指定，每完成一个请求就流式写入该文件(JSONL格式)
+        """
         traces = []
+        write_lock = threading.Lock()  # 用于保护文件写入
+
+        # 如果指定了trace_file，清空并准备写入
+        if trace_file:
+            Path(trace_file).parent.mkdir(parents=True, exist_ok=True)
+            open(trace_file, 'w').close()
 
         # [C] Each request gets its own submit_time
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -367,12 +458,31 @@ class SystemBenchmark:
                 futures.append(future)
 
             for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                if verbose:
-                    print(f"[{i+1}/{len(questions)}] Request completed")
                 trace = future.result()
                 traces.append(trace)
 
+                # 流式写入(线程安全)
+                if trace_file:
+                    with write_lock:
+                        append_trace_jsonl(trace, trace_file)
+
+                if verbose:
+                    status = "✓" if trace.success else "✗"
+                    print(f"[{i+1}/{len(questions)}] {status} Request {trace.request_id} completed, "
+                          f"Latency: {trace.e2e_latency:.2f}s")
+
         return traces
+
+
+def append_trace_jsonl(trace: RequestTrace, output_path: str):
+    """
+    流式追加单条trace到JSONL文件
+
+    每完成一个请求就写入一行，内存友好，支持中断恢复
+    """
+    with open(output_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(asdict(trace), ensure_ascii=False) + "\n")
+        f.flush()  # 立即刷新到磁盘
 
 
 def compute_statistics(traces: List[RequestTrace]) -> Dict[str, Any]:
@@ -465,11 +575,28 @@ def compute_statistics(traces: List[RequestTrace]) -> Dict[str, Any]:
 
 
 def save_traces(traces: List[RequestTrace], output_path: str):
-    """Save traces to JSON file"""
+    """
+    Save traces to JSON file (批量写入，用于兼容旧代码)
+
+    注意: 推荐使用流式写入 append_trace_jsonl，内存更友好
+    """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump([asdict(t) for t in traces], f, ensure_ascii=False, indent=2)
+
+
+def save_traces_jsonl(traces: List[RequestTrace], output_path: str):
+    """
+    Save traces to JSONL file (批量写入JSONL格式)
+
+    每行一个JSON对象，便于流式读取和追加
+    """
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for trace in traces:
+            f.write(json.dumps(asdict(trace), ensure_ascii=False) + "\n")
 
 
 def load_traces(trace_file: str) -> List[Dict[str, Any]]:
@@ -478,14 +605,23 @@ def load_traces(trace_file: str) -> List[Dict[str, Any]]:
         return json.load(f)
 
 
-def load_jsonl(filepath: str):
-    """Load JSONL file"""
+def load_traces_jsonl(trace_file: str) -> List[Dict[str, Any]]:
+    """
+    Load request traces from JSONL file
+
+    支持读取流式写入的JSONL格式
+    """
     records = []
-    with open(filepath, 'r') as f:
+    with open(trace_file, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip():
                 records.append(json.loads(line))
     return records
+
+
+def load_jsonl(filepath: str):
+    """Load JSONL file (alias for load_traces_jsonl)"""
+    return load_traces_jsonl(filepath)
 
 
 def plot_latency_cdf(traces_dict: Dict[str, List[Dict]], output_file: str):
@@ -861,6 +997,8 @@ def plot_node_latency_stacked_bar(node_times, output_path):
 def run_system_benchmark(examples, k, max_hops, concurrency, verbose):
     """Run system-level benchmark (latency, throughput, tail behavior)"""
     print("[Step 1/3] Running system-level benchmark...")
+
+    # 使用JSON格式
     trace_file = HOP2RAG_RESULTS_DIR / "hop2rag_traces.json"
 
     # Prepare questions
@@ -875,22 +1013,26 @@ def run_system_benchmark(examples, k, max_hops, concurrency, verbose):
     )
 
     try:
+        # 批量运行
         if concurrency == 1:
             traces = bench.run_serial(questions, verbose=verbose)
         else:
-            traces = bench.run_concurrent(questions, max_workers=concurrency, verbose=verbose)
+            traces = bench.run_concurrent(questions, max_workers=concurrency,
+                                          verbose=verbose)
 
         # Compute statistics
         stats = compute_statistics(traces)
 
-        # Save traces
-        save_traces(traces, trace_file)
+        # 批量保存traces为JSON格式
+        save_traces(traces, str(trace_file))
 
         # Save statistics
         stats_file = Path(trace_file).with_suffix('.stats.json')
         with open(stats_file, 'w', encoding='utf-8') as f:
             json.dump(stats, f, ensure_ascii=False, indent=2)
 
+        print(f"\n✓ Traces saved to: {trace_file} (JSON format, {len(traces)} requests)")
+        print(f"✓ Statistics saved to: {stats_file}")
         print()
         return trace_file
 
@@ -1028,6 +1170,7 @@ def generate_visualizations(trace_file, instrumentation_log, skip_plots):
         return
 
     # System-level plots
+    # 使用 load_traces 读取 JSON 格式
     traces = load_traces(trace_file)
     workflow_name = Path(trace_file).stem.replace('_traces', '')
 
