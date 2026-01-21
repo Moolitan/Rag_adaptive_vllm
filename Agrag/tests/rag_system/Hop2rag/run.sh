@@ -14,7 +14,7 @@ export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_ho
 export AGRAG_COLLECTION_NAME="hotpot_fullwiki"   
 
 python tests/rag_system/Hop2rag/test_hop2rag_latency.py \
-        --limit 50 \
-        --k 50 \
+        --limit 30 \
+        --k 10 \
         --max-hops 3 \
         --enable-instrumentation

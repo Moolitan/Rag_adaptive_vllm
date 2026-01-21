@@ -1,15 +1,15 @@
 
 import argparse
-import subprocess
 import sys
 import os
 import json
 import time
 import threading
+import hashlib
 from pathlib import Path
 from collections import defaultdict
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Any, Optional
 import numpy as np
 import concurrent.futures
 
@@ -18,11 +18,29 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import seaborn as sns
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
-    print("[WARN] matplotlib not found. Visualization disabled.")
+
+# Try to import seaborn (optional)
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
+
+# Try to import tokenizer
+try:
+    from transformers import AutoTokenizer
+    HAS_HF_TOKENIZER = True
+except ImportError:
+    HAS_HF_TOKENIZER = False
+
+try:
+    import tiktoken
+    HAS_TIKTOKEN = True
+except ImportError:
+    HAS_TIKTOKEN = False
 
 ROOT = Path(__file__).resolve().parents[3]  # Agrag directory
 TESTS_DIR = ROOT / "tests"
@@ -48,6 +66,7 @@ from Rag.hop2_rag import (
     enable_instrumentation,
     disable_instrumentation,
     clear_instrumentation_log,
+    save_workflow_graph,
 )
 from tests.cores import load_hotpotqa_fullwiki
 
@@ -72,6 +91,116 @@ if HAS_MATPLOTLIB:
     })
 
 
+# =============================
+# Tokenizer Utilities
+# =============================
+
+class TokenCounter:
+    """Token counter with multiple backend support"""
+
+    def __init__(self, model_name: str = "gpt-3.5-turbo"):
+        self.tokenizer = None
+        self.backend = "unknown"
+
+        # Try HuggingFace tokenizer first
+        if HAS_HF_TOKENIZER:
+            try:
+                # Try to load a common tokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    "Qwen/Qwen2.5-7B-Instruct",
+                    trust_remote_code=True
+                )
+                self.backend = "huggingface"
+            except Exception:
+                pass
+
+        # Fallback to tiktoken
+        if self.tokenizer is None and HAS_TIKTOKEN:
+            try:
+                self.tokenizer = tiktoken.encoding_for_model(model_name)
+                self.backend = "tiktoken"
+            except Exception:
+                try:
+                    self.tokenizer = tiktoken.get_encoding("cl100k_base")
+                    self.backend = "tiktoken"
+                except Exception:
+                    pass
+
+    def count(self, text: str) -> int:
+        """Count tokens in text"""
+        if not text:
+            return 0
+
+        if self.tokenizer is None:
+            return 0
+
+        try:
+            if self.backend == "huggingface":
+                return len(self.tokenizer.encode(text))
+            elif self.backend == "tiktoken":
+                return len(self.tokenizer.encode(text))
+        except Exception:
+            return 0
+
+        return 0
+
+    def get_source(self) -> str:
+        """Get token source identifier"""
+        if self.backend == "huggingface":
+            return "tokenizer_hf"
+        elif self.backend == "tiktoken":
+            return "tokenizer_tiktoken"
+        return "unknown"
+
+
+# Global token counter (lazy init)
+_token_counter: Optional[TokenCounter] = None
+
+def get_token_counter() -> TokenCounter:
+    global _token_counter
+    if _token_counter is None:
+        _token_counter = TokenCounter()
+    return _token_counter
+
+
+def estimate_prompt_tokens(question: str, documents: List[Any]) -> int:
+    """
+    Estimate prompt tokens by reconstructing approximate prompt structure.
+    This mimics the actual prompt construction in hop2_rag.py.
+    """
+    counter = get_token_counter()
+
+    # Construct approximate prompt (matching MULTI_HOP_RAG_PROMPT structure)
+    context_parts = []
+    for i, doc in enumerate(documents):
+        content = doc.page_content if hasattr(doc, 'page_content') else str(doc)
+        context_parts.append(f"[Doc {i+1}] {content}")
+
+    context = "\n\n".join(context_parts)
+
+    # Approximate prompt template
+    prompt = f"""Answer a multi-hop question using evidence from multiple retrieval steps.
+
+Original question: {question}
+
+=== Evidence from multiple hops ===
+{context}
+
+Hop history:
+[hop history placeholder]
+
+Instructions:
+1. Synthesize information across ALL hops
+2. For comparison questions: Compare attributes found in different hops
+3. For bridge questions: Connect intermediate entity to final answer
+4. Ground your answer in the evidence provided
+5. Give a direct, concise answer
+
+Answer:"""
+
+    return counter.count(prompt)
+
+
 @dataclass
 class RequestTrace:
     """Request-level trace for system analysis"""
@@ -89,9 +218,15 @@ class RequestTrace:
     retrieval_time: float = 0.0 # Retrieval stage time
     llm_time: float = 0.0       # LLM inference time
 
-    # Context & tokens
-    context_tokens: int = 0     # Total context tokens sent to LLM
-    output_tokens: int = 0      # Generated tokens
+    # Token statistics (A: proper token counting)
+    prompt_tokens: int = 0      # Tokens in prompt sent to LLM
+    completion_tokens: int = 0  # Generated tokens
+    total_tokens: int = 0       # prompt + completion
+    token_source: str = "unknown"  # {"usage", "tokenizer_estimate", "unknown"}
+
+    # Legacy fields (kept for backward compatibility)
+    context_tokens: int = 0     # Alias for prompt_tokens
+    output_tokens: int = 0      # Alias for completion_tokens
 
     # Multi-hop specific
     num_hops: int = 0           # Number of hops executed
@@ -121,6 +256,7 @@ class SystemBenchmark:
         self.retrieval_k = retrieval_k
         self.max_hops = max_hops
         self.app = get_hop2_rag_app()
+        self.token_counter = get_token_counter()
 
         # Shared state for concurrency tracking
         self.active_requests = 0
@@ -162,13 +298,28 @@ class SystemBenchmark:
             trace.num_hops = metadata.get("total_hops", 0)
             trace.hop_queries = metadata.get("hop_queries", [])
 
-            # Context tokens (estimate from documents)
+            # [A] Token counting - proper implementation
             all_docs = result.get("documents", [])
-            trace.context_tokens = sum(len(d.page_content.split()) for d in all_docs) if all_docs else 0
-
-            # Output tokens (estimate from generation)
             answer = result.get("answer", "")
-            trace.output_tokens = len(answer.split()) if answer else 0
+
+            # Check if result contains LLM usage stats
+            usage = result.get("usage", {})
+            if usage and "prompt_tokens" in usage:
+                # Use actual usage from LLM
+                trace.prompt_tokens = usage.get("prompt_tokens", 0)
+                trace.completion_tokens = usage.get("completion_tokens", 0)
+                trace.total_tokens = usage.get("total_tokens", 0)
+                trace.token_source = "usage"
+            else:
+                # Estimate using tokenizer
+                trace.prompt_tokens = estimate_prompt_tokens(question, all_docs)
+                trace.completion_tokens = self.token_counter.count(answer)
+                trace.total_tokens = trace.prompt_tokens + trace.completion_tokens
+                trace.token_source = self.token_counter.get_source()
+
+            # Backward compatibility
+            trace.context_tokens = trace.prompt_tokens
+            trace.output_tokens = trace.completion_tokens
 
             trace.end_time = end_time
             trace.e2e_latency = end_time - start_time
@@ -186,7 +337,7 @@ class SystemBenchmark:
 
         return trace
 
-    def run_serial(self, questions: List[tuple[str, str]], verbose: bool = True) -> List[RequestTrace]:
+    def run_serial(self, questions: List[tuple], verbose: bool = True) -> List[RequestTrace]:
         """Run requests serially (concurrency=1)"""
         traces = []
 
@@ -199,18 +350,19 @@ class SystemBenchmark:
             traces.append(trace)
 
             if verbose:
-                print(f"  ✓ Latency: {trace.e2e_latency:.2f}s, Hops: {trace.num_hops}, Tokens: {trace.context_tokens}")
+                print(f"  ✓ Latency: {trace.e2e_latency:.2f}s, Hops: {trace.num_hops}, Tokens: {trace.prompt_tokens} ({trace.token_source})")
 
         return traces
 
-    def run_concurrent(self, questions: List[tuple[str, str]], max_workers: int, verbose: bool = True) -> List[RequestTrace]:
+    def run_concurrent(self, questions: List[tuple], max_workers: int, verbose: bool = True) -> List[RequestTrace]:
         """Run requests with controlled concurrency"""
         traces = []
-        submit_time = time.time()
 
+        # [C] Each request gets its own submit_time
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for req_id, question in questions:
+                submit_time = time.time()  # Individual submit time
                 future = executor.submit(self.run_single_request, req_id, question, submit_time)
                 futures.append(future)
 
@@ -229,57 +381,85 @@ def compute_statistics(traces: List[RequestTrace]) -> Dict[str, Any]:
     if not traces:
         return {}
 
-    latencies = [t.e2e_latency for t in traces if t.success]
-    latencies_sorted = sorted(latencies)
-    n = len(latencies_sorted)
+    successful_traces = [t for t in traces if t.success]
+    latencies = [t.e2e_latency for t in successful_traces]
+    n = len(latencies)
 
     if n == 0:
         return {"error": "No successful requests"}
 
-    # Percentiles
-    p50 = latencies_sorted[int(n * 0.50)] if n > 0 else 0
-    p95 = latencies_sorted[int(n * 0.95)] if n > 0 else 0
-    p99 = latencies_sorted[int(n * 0.99)] if n > 0 else 0
+    # [C] Percentiles using np.percentile (statistically correct)
+    latencies_arr = np.array(latencies)
+    p50 = float(np.percentile(latencies_arr, 50))
+    p95 = float(np.percentile(latencies_arr, 95))
+    p99 = float(np.percentile(latencies_arr, 99))
 
-    # Timing
-    total_time = max(t.end_time for t in traces) - min(t.submit_time for t in traces)
-    throughput = len(traces) / total_time if total_time > 0 else 0
+    # [C] Timing with proper wall time calculation
+    earliest_submit = min(t.submit_time for t in traces)
+    latest_end = max(t.end_time for t in traces)
+    wall_time = latest_end - earliest_submit
+    throughput = len(successful_traces) / wall_time if wall_time > 0 else 0
 
-    # Context & hops
-    avg_context_tokens = sum(t.context_tokens for t in traces) / len(traces)
-    avg_output_tokens = sum(t.output_tokens for t in traces) / len(traces)
-    avg_hops = sum(t.num_hops for t in traces) / len(traces)
+    # Queue time statistics (for concurrent runs)
+    queue_times = [t.start_time - t.submit_time for t in successful_traces]
+    avg_queue_time = np.mean(queue_times) if queue_times else 0
+    p95_queue_time = float(np.percentile(queue_times, 95)) if len(queue_times) > 0 else 0
+
+    # Token statistics
+    prompt_tokens = [t.prompt_tokens for t in successful_traces]
+    completion_tokens = [t.completion_tokens for t in successful_traces]
+    total_tokens = [t.total_tokens for t in successful_traces]
+
+    avg_prompt_tokens = np.mean(prompt_tokens) if prompt_tokens else 0
+    avg_completion_tokens = np.mean(completion_tokens) if completion_tokens else 0
+    avg_total_tokens = np.mean(total_tokens) if total_tokens else 0
+
+    # Token source (should be consistent)
+    token_sources = list(set(t.token_source for t in successful_traces))
+    token_source = token_sources[0] if len(token_sources) == 1 else "mixed"
+
+    # Hop statistics
+    hops = [t.num_hops for t in successful_traces]
+    avg_hops = np.mean(hops) if hops else 0
 
     # Hop distribution
     hop_counts = {}
-    for t in traces:
+    for t in successful_traces:
         h = t.num_hops
         hop_counts[h] = hop_counts.get(h, 0) + 1
 
     return {
         "total_requests": len(traces),
-        "successful_requests": sum(1 for t in traces if t.success),
-        "failed_requests": sum(1 for t in traces if not t.success),
+        "successful_requests": len(successful_traces),
+        "failed_requests": len(traces) - len(successful_traces),
 
         # Latency (seconds)
-        "latency_mean": sum(latencies) / n,
+        "latency_mean": float(np.mean(latencies_arr)),
+        "latency_std": float(np.std(latencies_arr)),
         "latency_median": p50,
         "latency_p95": p95,
         "latency_p99": p99,
-        "latency_min": min(latencies),
-        "latency_max": max(latencies),
+        "latency_min": float(np.min(latencies_arr)),
+        "latency_max": float(np.max(latencies_arr)),
 
-        # Throughput
-        "total_time_sec": total_time,
+        # [C] Throughput (corrected)
+        "wall_time_sec": wall_time,
         "throughput_req_per_sec": throughput,
-        "concurrency": traces[0].concurrent_requests if traces else 1,
+        "avg_queue_time_sec": float(avg_queue_time),
+        "p95_queue_time_sec": p95_queue_time,
 
-        # Context & tokens
-        "avg_context_tokens": avg_context_tokens,
-        "avg_output_tokens": avg_output_tokens,
+        # [A] Token statistics
+        "avg_prompt_tokens": float(avg_prompt_tokens),
+        "avg_completion_tokens": float(avg_completion_tokens),
+        "avg_total_tokens": float(avg_total_tokens),
+        "token_source": token_source,
+
+        # Legacy (backward compatibility)
+        "avg_context_tokens": float(avg_prompt_tokens),
+        "avg_output_tokens": float(avg_completion_tokens),
 
         # Multi-hop
-        "avg_hops": avg_hops,
+        "avg_hops": float(avg_hops),
         "hop_distribution": hop_counts,
     }
 
@@ -322,7 +502,7 @@ def plot_latency_cdf(traces_dict: Dict[str, List[Dict]], output_file: str):
             continue
 
         cdf = np.arange(1, n + 1) / n
-        ax.plot(latencies, cdf, label=workflow_name, linewidth=2.5, marker='o', markersize=4, markevery=n//10)
+        ax.plot(latencies, cdf, label=workflow_name, linewidth=2.5, marker='o', markersize=4, markevery=max(1, n//10))
 
     ax.set_xlabel('End-to-End Latency (seconds)')
     ax.set_ylabel('Cumulative Probability')
@@ -331,43 +511,40 @@ def plot_latency_cdf(traces_dict: Dict[str, List[Dict]], output_file: str):
     ax.grid(True, alpha=0.3)
 
     # Mark P95 and P99 lines
-    ax.axhline(y=0.95, color='red', linestyle='--', alpha=0.5, linewidth=1, label='P95')
-    ax.axhline(y=0.99, color='darkred', linestyle='--', alpha=0.5, linewidth=1, label='P99')
+    ax.axhline(y=0.95, color='red', linestyle='--', alpha=0.5, linewidth=1)
+    ax.axhline(y=0.99, color='darkred', linestyle='--', alpha=0.5, linewidth=1)
 
     plt.tight_layout()
     plt.savefig(output_file)
     plt.close()
 
-    print(f"✓ Saved CDF plot: {output_file}")
-
 
 def plot_context_vs_latency(traces: List[Dict], output_file: str):
-    """Scatter plot: context tokens vs latency"""
+    """Scatter plot: prompt tokens vs latency (renamed from context_tokens)"""
     if not HAS_MATPLOTLIB:
         return
 
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    context_tokens = [t['context_tokens'] for t in traces if t['success']]
+    # [A] Use prompt_tokens instead of context_tokens
+    prompt_tokens = [t.get('prompt_tokens', t.get('context_tokens', 0)) for t in traces if t['success']]
     latencies = [t['e2e_latency'] for t in traces if t['success']]
     hops = [t['num_hops'] for t in traces if t['success']]
 
-    scatter = ax.scatter(context_tokens, latencies, c=hops, cmap='viridis',
+    scatter = ax.scatter(prompt_tokens, latencies, c=hops, cmap='viridis',
                         s=100, alpha=0.6, edgecolors='black', linewidths=0.5)
 
     cbar = plt.colorbar(scatter, ax=ax)
     cbar.set_label('Number of Hops')
 
-    ax.set_xlabel('Context Tokens')
+    ax.set_xlabel('Prompt Tokens')
     ax.set_ylabel('End-to-End Latency (seconds)')
-    ax.set_title('Context Growth vs Latency (colored by hops)')
+    ax.set_title('Prompt Tokens vs Latency (colored by hops)')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(output_file)
     plt.close()
-
-    print(f"✓ Saved scatter plot: {output_file}")
 
 
 def plot_hop_distribution(traces: List[Dict], output_file: str):
@@ -385,7 +562,13 @@ def plot_hop_distribution(traces: List[Dict], output_file: str):
     hops = sorted(hop_counts.keys())
     counts = [hop_counts[h] for h in hops]
 
-    bars = ax.bar(hops, counts, color=sns.color_palette("Set2")[0], alpha=0.8, edgecolor='black')
+    # Use default colors if seaborn not available
+    if HAS_SEABORN:
+        color = sns.color_palette("Set2")[0]
+    else:
+        color = '#66c2a5'
+
+    bars = ax.bar(hops, counts, color=color, alpha=0.8, edgecolor='black')
 
     for bar, count in zip(bars, counts):
         height = bar.get_height()
@@ -401,8 +584,6 @@ def plot_hop_distribution(traces: List[Dict], output_file: str):
     plt.tight_layout()
     plt.savefig(output_file)
     plt.close()
-
-    print(f"✓ Saved hop distribution: {output_file}")
 
 
 def plot_latency_by_hops(traces: List[Dict], output_file: str):
@@ -420,13 +601,22 @@ def plot_latency_by_hops(traces: List[Dict], output_file: str):
                 hop_latencies[h] = []
             hop_latencies[h].append(t['e2e_latency'])
 
+    if not hop_latencies:
+        plt.close()
+        return
+
     hops = sorted(hop_latencies.keys())
     data = [hop_latencies[h] for h in hops]
     labels = [f'{h} hops' for h in hops]
 
     bp = ax.boxplot(data, labels=labels, patch_artist=True, showmeans=True)
 
-    colors = sns.color_palette("coolwarm", len(data))
+    # Use default colors if seaborn not available
+    if HAS_SEABORN:
+        colors = sns.color_palette("coolwarm", len(data))
+    else:
+        colors = plt.cm.coolwarm(np.linspace(0.2, 0.8, len(data)))
+
     for patch, color in zip(bp['boxes'], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
@@ -439,7 +629,72 @@ def plot_latency_by_hops(traces: List[Dict], output_file: str):
     plt.savefig(output_file)
     plt.close()
 
-    print(f"✓ Saved latency-by-hops plot: {output_file}")
+
+def plot_tokens_histogram(traces: List[Dict], output_file: str):
+    """[D] Histogram of token counts"""
+    if not HAS_MATPLOTLIB:
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    prompt_tokens = [t.get('prompt_tokens', 0) for t in traces if t['success']]
+    completion_tokens = [t.get('completion_tokens', 0) for t in traces if t['success']]
+
+    # Prompt tokens histogram
+    if prompt_tokens and max(prompt_tokens) > 0:
+        axes[0].hist(prompt_tokens, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+        axes[0].set_xlabel('Prompt Tokens')
+        axes[0].set_ylabel('Frequency')
+        axes[0].set_title('Prompt Token Distribution')
+        axes[0].axvline(np.mean(prompt_tokens), color='red', linestyle='--', label=f'Mean: {np.mean(prompt_tokens):.0f}')
+        axes[0].legend()
+
+    # Completion tokens histogram
+    if completion_tokens and max(completion_tokens) > 0:
+        axes[1].hist(completion_tokens, bins=20, color='forestgreen', alpha=0.7, edgecolor='black')
+        axes[1].set_xlabel('Completion Tokens')
+        axes[1].set_ylabel('Frequency')
+        axes[1].set_title('Completion Token Distribution')
+        axes[1].axvline(np.mean(completion_tokens), color='red', linestyle='--', label=f'Mean: {np.mean(completion_tokens):.0f}')
+        axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+
+
+def plot_latency_vs_prompt_tokens(traces: List[Dict], output_file: str):
+    """[D] Scatter plot: latency vs prompt tokens with regression line"""
+    if not HAS_MATPLOTLIB:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    prompt_tokens = np.array([t.get('prompt_tokens', 0) for t in traces if t['success']])
+    latencies = np.array([t['e2e_latency'] for t in traces if t['success']])
+
+    if len(prompt_tokens) == 0 or max(prompt_tokens) == 0:
+        plt.close()
+        return
+
+    ax.scatter(prompt_tokens, latencies, alpha=0.6, s=80, edgecolors='black', linewidths=0.5)
+
+    # Add trend line
+    if len(prompt_tokens) > 2:
+        z = np.polyfit(prompt_tokens, latencies, 1)
+        p = np.poly1d(z)
+        x_line = np.linspace(min(prompt_tokens), max(prompt_tokens), 100)
+        ax.plot(x_line, p(x_line), "r--", alpha=0.8, linewidth=2, label=f'Trend: {z[0]:.4f}x + {z[1]:.2f}')
+        ax.legend()
+
+    ax.set_xlabel('Prompt Tokens')
+    ax.set_ylabel('End-to-End Latency (seconds)')
+    ax.set_title('Latency vs Prompt Tokens')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
 
 
 def plot_node_latency_breakdown(node_times, output_path):
@@ -459,7 +714,6 @@ def plot_node_latency_breakdown(node_times, output_path):
     plt.title('Per-Node Latency Breakdown (Hop2Rag)', fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved node breakdown plot: {output_path}")
     plt.close()
 
 
@@ -479,7 +733,6 @@ def plot_instrumentation_latency_cdf(total_latencies, output_path):
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved instrumentation CDF plot: {output_path}")
     plt.close()
 
 
@@ -504,6 +757,9 @@ def plot_latency_pie_chart(node_times, edge_times, output_path):
 
     # 合并小于总耗时2%的组件为"其他"
     total_time = sum(v for _, v in sorted_components)
+    if total_time == 0:
+        return
+
     threshold = total_time * 0.02
 
     main_components = []
@@ -564,7 +820,6 @@ def plot_latency_pie_chart(node_times, edge_times, output_path):
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved latency pie chart: {output_path}")
     plt.close()
 
 
@@ -600,7 +855,6 @@ def plot_node_latency_stacked_bar(node_times, output_path):
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved stacked bar chart: {output_path}")
     plt.close()
 
 
@@ -674,7 +928,8 @@ def run_instrumentation(examples, k, max_hops, verbose):
             )
 
             if verbose:
-                print(f"  [{i+1}/{len(examples)}] Query completed: {result.get('timing_ms', 0):.2f} ms")
+                hops = result.get("metadata", {}).get("total_hops", 0)
+                print(f"  [{i+1}/{len(examples)}] Hops: {hops}, Time: {result.get('timing_ms', 0):.2f} ms")
 
         except Exception as e:
             print(f"  [{i+1}/{len(examples)}] Query failed: {e}")
@@ -761,6 +1016,13 @@ def generate_visualizations(trace_file, instrumentation_log, skip_plots):
 
     print("[Step 3/3] Generating visualization plots...")
 
+    # 生成工作流图
+    workflow_graph_path = str(PLOTS_DIR / 'hop2rag_workflow.png')
+    if save_workflow_graph(workflow_graph_path):
+        print(f"  ✓ Workflow graph saved: {workflow_graph_path}")
+    else:
+        print("  ⚠ Could not generate workflow graph (missing dependencies)")
+
     if not HAS_MATPLOTLIB:
         print("  Matplotlib not available, skipping plots")
         return
@@ -776,7 +1038,7 @@ def generate_visualizations(trace_file, instrumentation_log, skip_plots):
 
     plot_context_vs_latency(
         traces,
-        str(PLOTS_DIR / 'context_vs_latency.png')
+        str(PLOTS_DIR / 'prompt_tokens_vs_latency.png')  # Renamed
     )
 
     plot_hop_distribution(
@@ -787,6 +1049,17 @@ def generate_visualizations(trace_file, instrumentation_log, skip_plots):
     plot_latency_by_hops(
         traces,
         str(PLOTS_DIR / 'latency_by_hops.png')
+    )
+
+    # [D] New plots
+    plot_tokens_histogram(
+        traces,
+        str(PLOTS_DIR / 'tokens_histogram.png')
+    )
+
+    plot_latency_vs_prompt_tokens(
+        traces,
+        str(PLOTS_DIR / 'latency_vs_prompt_tokens.png')
     )
 
     # Instrumentation plots
@@ -854,24 +1127,38 @@ def print_summary(trace_file, instrumentation_log, skip_plots):
     print(f"  Plots:               {PLOTS_DIR}/")
     print()
 
-    if not skip_plots and HAS_MATPLOTLIB:
-        print("Generated plots:")
-        print("  - latency_cdf.png              (Tail latency distribution)")
-        print("  - context_vs_latency.png       (Context growth analysis)")
-        print("  - hop_distribution.png         (Hop count histogram)")
-        print("  - latency_by_hops.png          (Latency vs hops)")
-        if instrumentation_log and instrumentation_log.exists():
-            print("  - node_latency_breakdown.png   (Node timing breakdown - bar chart)")
-            print("  - instrumentation_latency_cdf.png (Instrumentation CDF)")
-            print("  - latency_pie_chart.png        (Node/Edge latency proportion - pie chart)")
-            print("  - node_latency_stacked_bar.png (Per-request latency breakdown)")
+    # Print hop distribution summary
+    stats_file = trace_file.with_suffix('.stats.json')
+    if stats_file.exists():
+        with open(stats_file, 'r') as f:
+            stats = json.load(f)
+        hop_dist = stats.get("hop_distribution", {})
+        print("Hop Distribution:")
+        for h in sorted(hop_dist.keys(), key=lambda x: int(x)):
+            print(f"  {h} hops: {hop_dist[h]} requests")
+        print(f"  Average hops: {stats.get('avg_hops', 0):.2f}")
         print()
 
-    print("Next steps:")
-    print(f"  1. View plots:          cd {PLOTS_DIR} && ls *.png")
-    print(f"  2. Check system traces: cat {trace_file}")
-    print(f"  3. Check system stats:  cat {trace_file.with_suffix('.stats.json')}")
-    print()
+        print("Token Statistics:")
+        print(f"  Avg prompt tokens:     {stats.get('avg_prompt_tokens', 0):.0f}")
+        print(f"  Avg completion tokens: {stats.get('avg_completion_tokens', 0):.0f}")
+        print(f"  Token source:          {stats.get('token_source', 'unknown')}")
+        print()
+
+    if not skip_plots and HAS_MATPLOTLIB:
+        print("Generated plots:")
+        print("  - latency_cdf.png                (Tail latency distribution)")
+        print("  - prompt_tokens_vs_latency.png   (Token growth analysis)")
+        print("  - hop_distribution.png           (Hop count histogram)")
+        print("  - latency_by_hops.png            (Latency vs hops)")
+        print("  - tokens_histogram.png           (Token distribution)")
+        print("  - latency_vs_prompt_tokens.png   (Latency correlation)")
+        if instrumentation_log and instrumentation_log.exists():
+            print("  - node_latency_breakdown.png     (Node timing breakdown)")
+            print("  - instrumentation_latency_cdf.png (Instrumentation CDF)")
+            print("  - latency_pie_chart.png          (Component breakdown)")
+            print("  - node_latency_stacked_bar.png   (Per-request breakdown)")
+        print()
 
 
 def main():
@@ -939,13 +1226,14 @@ Examples:
         sys.exit(1)
 
     print("=" * 80)
-    print("Hop2Rag Performance Optimized Test Suite")
+    print("Hop2Rag Performance Benchmark Suite")
     print("=" * 80)
     print(f"Questions:          {args.limit}")
     print(f"Retrieval K:        {args.k}")
     print(f"Max Hops:           {args.max_hops}")
     print(f"Concurrency:        {args.concurrency}")
     print(f"Instrumentation:    {'Enabled' if args.enable_instrumentation else 'Disabled'}")
+    print(f"Token Counter:      {get_token_counter().backend}")
     print(f"Results:            {HOP2RAG_RESULTS_DIR}")
     print(f"PERSIST_DIR:        {PERSIST_DIR}")
     print(f"COLLECTION_NAME:    {COLLECTION_NAME}")

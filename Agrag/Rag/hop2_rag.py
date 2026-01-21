@@ -2,9 +2,11 @@ import time
 import json
 import uuid
 import re
-from typing import TypedDict, List, Dict, Any, Tuple
+import math
+from typing import TypedDict, List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from functools import wraps
+from collections import Counter
 
 import numpy as np
 from langchain_core.documents import Document
@@ -77,7 +79,7 @@ class PerformanceTracker:
 
     def enable(self, output_dir: str, filename: str = "hop2rag_timings.jsonl"):
         """启用性能追踪并设置输出目录"""
-        self.close()  # 关闭之前的句柄
+        self.close()
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.filename = filename
@@ -94,14 +96,13 @@ class PerformanceTracker:
         """追加写入一条 JSONL 记录"""
         if self._enabled and self.file_handle:
             self.file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            self.file_handle.flush()  # 确保立即写入
+            self.file_handle.flush()
 
     def clear_log(self):
         """清空日志文件"""
         if self.jsonl_path and self.jsonl_path.exists():
             self.close()
             self.jsonl_path.unlink()
-            # 重新打开
             if self._enabled:
                 self.file_handle = open(self.jsonl_path, "a", buffering=1<<20)
 
@@ -114,17 +115,11 @@ class PerformanceTracker:
         self.close()
 
 
-# 全局追踪器(默认禁用，需要显式启用)
 _tracker = PerformanceTracker()
 
 
 def enable_instrumentation(output_dir: str, filename: str = "hop2rag_timings.jsonl"):
-    """启用性能追踪
-
-    Args:
-        output_dir: 输出目录路径
-        filename: 输出文件名
-    """
+    """启用性能追踪"""
     _tracker.enable(output_dir, filename)
 
 
@@ -208,22 +203,23 @@ def get_llm(json_mode: bool = False, temperature: float = 0):
 # 提示词定义
 # =============================
 
-# 问题分解提示词
 QUESTION_DECOMPOSER_PROMPT = """You are a question decomposition expert for multi-hop reasoning tasks.
 
 Current hop: {current_hop}
 Original question: {original_question}
 Evidence so far: {evidence}
+Previous queries: {previous_queries}
 
 Instructions:
+- Generate a NEW search query that is DIFFERENT from all previous queries
 - Hop 0 (initial): Extract the first entity/concept to search for
 - Hop 1+: Based on evidence, determine what to search next
 - For bridge questions: Find intermediate entity, then search for final answer
-- For comparison questions: Identify each entity to compare
+- For comparison questions: If hop 0 searched entity A, hop 1 must search entity B
+- If you believe we have sufficient information, output "DONE" as the query
 
-Return JSON: {{"query": "search query for this hop", "reasoning": "why this query"}}"""
+Return JSON: {{"query": "search query for this hop OR 'DONE' if sufficient", "reasoning": "why this query", "target_entity": "the main entity being searched"}}"""
 
-# 线索提取提示词
 CLUE_EXTRACTOR_PROMPT = """Extract key entities/clues from retrieved documents for multi-hop reasoning.
 
 Original question: {question}
@@ -239,7 +235,6 @@ Instructions:
 
 Return JSON: {{"clues": ["entity1", "entity2"], "summary": "brief summary"}}"""
 
-# 跳数决策提示词
 HOP_DECISION_PROMPT = """Determine if another retrieval hop is needed.
 
 Original question: {question}
@@ -256,108 +251,101 @@ Instructions:
 
 Return JSON: {{"decision": "yes" or "no", "reasoning": "explanation"}}"""
 
-# 多跳RAG生成提示词
 MULTI_HOP_RAG_PROMPT = """Answer a multi-hop question using evidence from multiple retrieval steps.
 
 Original question: {question}
 
-=== Evidence from multiple hops ===
+=== Collected Evidence ===
+{evidence}
+
+=== Supporting Documents ===
 {context}
 
-Hop history:
-{hop_history}
-
 Instructions:
-1. Synthesize information across ALL hops
-2. For comparison questions: Compare attributes found in different hops
-3. For bridge questions: Connect intermediate entity to final answer
-4. Ground your answer in the evidence provided
-5. Give a direct, concise answer
+1. Synthesize information from the evidence across ALL hops
+2. For comparison questions: Compare the specific attributes found
+3. For bridge questions: Connect the intermediate entity to the final answer
+4. Give a direct, concise answer grounded in the evidence
 
 Answer:"""
 
 
 # =============================
-# Reranker实现(非LLM)
+# BM25 Reranker (修复后的实现)
 # =============================
 
-class SimpleTFIDFEmbedder:
-    """简单的TF-IDF嵌入器"""
+class BM25Reranker:
+    """基于BM25的文档重排序器"""
 
-    def __init__(self):
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        self.vectorizer = TfidfVectorizer(max_features=384, stop_words='english')
-        self._fitted = False
-
-    def encode(self, texts: List[str]) -> np.ndarray:
-        if not self._fitted:
-            self.vectorizer.fit(texts)
-            self._fitted = True
-
-        try:
-            vectors = self.vectorizer.transform(texts).toarray()
-        except:
-            self.vectorizer.fit(texts)
-            vectors = self.vectorizer.transform(texts).toarray()
-
-        return vectors
-
-
-class EmbeddingReranker:
-    """基于embedding相似度的reranker"""
-
-    def __init__(self, threshold: float = 0.3):
+    def __init__(self, k1: float = 1.5, b: float = 0.75, threshold: float = 0.0):
+        self.k1 = k1
+        self.b = b
         self.threshold = threshold
-        self.embedding_model = SimpleTFIDFEmbedder()
+
+    def _tokenize(self, text: str) -> List[str]:
+        """简单分词"""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)
+        return [w for w in text.split() if len(w) > 1]
 
     def score_documents(self, query: str, documents: List[Document]) -> List[Tuple[Document, float]]:
-        """批量评分文档"""
+        """使用BM25对文档评分"""
         if not documents:
             return []
 
-        query_emb = self.embedding_model.encode([query])[0]
-        # 把每篇 doc 截断前 500 字符
-        doc_texts = [d.page_content[:500] for d in documents]
-        # TF-IDF 编码为 doc 向量
-        doc_embs = self.embedding_model.encode(doc_texts)
+        query_tokens = self._tokenize(query)
+        doc_tokens_list = [self._tokenize(d.page_content[:1000]) for d in documents]
+
+        doc_freq = Counter()
+        for doc_tokens in doc_tokens_list:
+            unique_tokens = set(doc_tokens)
+            for token in unique_tokens:
+                doc_freq[token] += 1
+
+        avg_dl = sum(len(dt) for dt in doc_tokens_list) / len(doc_tokens_list) if doc_tokens_list else 1
+        n_docs = len(documents)
 
         scores = []
-        for i, doc in enumerate(documents):
-            similarity = self._cosine_similarity(query_emb, doc_embs[i])
-            scores.append((doc, similarity))
+        for i, (doc, doc_tokens) in enumerate(zip(documents, doc_tokens_list)):
+            score = 0.0
+            dl = len(doc_tokens)
+            token_counts = Counter(doc_tokens)
 
+            for q_token in query_tokens:
+                if q_token in token_counts:
+                    df = doc_freq.get(q_token, 0)
+                    idf = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+                    tf = token_counts[q_token]
+                    tf_norm = (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * dl / avg_dl))
+                    score += idf * tf_norm
+
+            scores.append((doc, score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
         return scores
-
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 _reranker = None
 
 
-def get_reranker(threshold: float = 0.3) -> EmbeddingReranker:
+def get_reranker(threshold: float = 0.0) -> BM25Reranker:
     """获取reranker实例"""
     global _reranker
     if _reranker is None:
-        _reranker = EmbeddingReranker(threshold=threshold)
+        _reranker = BM25Reranker(threshold=threshold)
     return _reranker
 
 
 # =============================
-# Sentence Selector实现(非LLM)
+# Sentence Selector (使用BM25)
 # =============================
 
 class SentenceSelector:
-    """基于相似度的句子级supporting facts选择器"""
+    """基于BM25的句子级supporting facts选择器"""
 
     def __init__(self, top_m: int = 3):
         self.top_m = top_m
-        self.embedding_model = SimpleTFIDFEmbedder()
+        self.reranker = BM25Reranker()
 
     def extract_supporting_facts(
         self,
@@ -367,11 +355,9 @@ class SentenceSelector:
     ) -> List[Tuple[str, int]]:
         """提取supporting facts"""
         query = f"{question} {answer}"
-        query_emb = self.embedding_model.encode([query])[0]
 
         all_sentences = []
-        for doc_idx, doc in enumerate(documents):
-            # title 兜底逻辑：优先从多个字段获取，仍无则用稳定占位符
+        for doc in documents:
             doc_title = (
                 doc.metadata.get("title")
                 or doc.metadata.get("page_title")
@@ -381,44 +367,35 @@ class SentenceSelector:
                 or doc.metadata.get("id")
             )
             if not doc_title or (isinstance(doc_title, str) and not doc_title.strip()):
-                # 使用 page_content 的 hash 前8位作为稳定占位符
                 content_hash = hex(abs(hash(doc.page_content)))[2:10]
                 doc_title = f"Doc-{content_hash}"
 
             sentences = self._split_sentences(doc.page_content)
-
             for sent_idx, sent_text in enumerate(sentences):
                 if len(sent_text.strip()) > 10:
-                    all_sentences.append((doc_title, sent_idx, sent_text, doc))
+                    all_sentences.append((doc_title, sent_idx, sent_text))
 
         if not all_sentences:
             return []
 
-        sent_texts = [s[2] for s in all_sentences]
-        sent_embs = self.embedding_model.encode(sent_texts)
+        pseudo_docs = [Document(page_content=s[2]) for s in all_sentences]
+        scored = self.reranker.score_documents(query, pseudo_docs)
 
-        scored = []
-        for i, (doc_title, sent_idx, sent_text, doc_obj) in enumerate(all_sentences):
-            similarity = self._cosine_similarity(query_emb, sent_embs[i])
-            scored.append((doc_title, sent_idx, similarity, sent_text))
+        doc_to_info = {id(pd): (all_sentences[i][0], all_sentences[i][1])
+                       for i, pd in enumerate(pseudo_docs)}
 
-        scored.sort(key=lambda x: x[2], reverse=True)
+        result = []
+        for doc, score in scored[:self.top_m]:
+            if id(doc) in doc_to_info:
+                title, idx = doc_to_info[id(doc)]
+                result.append((title, idx))
 
-        result = [(title, idx) for title, idx, score, text in scored[:self.top_m]]
         return result
 
     @staticmethod
     def _split_sentences(text: str) -> List[str]:
         sentences = re.split(r'(?<=[.!?])\s+', text)
         return [s.strip() for s in sentences if s.strip()]
-
-    @staticmethod
-    def _cosine_similarity(a, b) -> float:
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 _sentence_selector = None
@@ -439,6 +416,8 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
 _custom_retrievers = {}
+
+
 def get_custom_retriever(persist_dir: str, collection_name: str, k: int = 10):
     """获取自定义retriever"""
     cache_key = f"{persist_dir}:{collection_name}:{k}"
@@ -480,7 +459,7 @@ def get_question_decomposer():
     if _question_decomposer is None:
         prompt = PromptTemplate(
             template=QUESTION_DECOMPOSER_PROMPT,
-            input_variables=["current_hop", "original_question", "evidence"]
+            input_variables=["current_hop", "original_question", "evidence", "previous_queries"]
         )
         _question_decomposer = prompt | get_llm(json_mode=True) | JsonOutputParser()
     return _question_decomposer
@@ -516,7 +495,7 @@ def get_multi_hop_rag_chain():
     if _multi_hop_rag_chain is None:
         prompt = PromptTemplate(
             template=MULTI_HOP_RAG_PROMPT,
-            input_variables=["question", "context", "hop_history"]
+            input_variables=["question", "evidence", "context"]
         )
         _multi_hop_rag_chain = prompt | get_llm() | StrOutputParser()
     return _multi_hop_rag_chain
@@ -553,32 +532,35 @@ def decompose_node(state: Hop2RagState) -> Dict[str, Any]:
     """问题分解节点"""
     current_hop = state.get("current_hop", 0)
     original_question = state["question"]
-    # 之前每一跳抽取出的中间证据
     evidence = state.get("hop_evidence", [])
     hop_queries = state.get("hop_queries", [])
     metadata = state.get("metadata", {})
 
-    # 把"历史证据"整理成 LLM 可读文本，桥接真正发生的地方
-    # Hop 0: Parasite - South Korean black comedy thriller film
-    # Hop 1: Parasite won Best Picture at the 2020 Oscars
     evidence_text = "\n".join([f"Hop {i}: {ev}" for i, ev in enumerate(evidence)]) if evidence else "None"
+    previous_queries_text = ", ".join([f'"{q}"' for q in hop_queries]) if hop_queries else "None"
 
     decomposer = get_question_decomposer()
     result = decomposer.invoke({
         "current_hop": current_hop,
         "original_question": original_question,
-        "evidence": evidence_text
+        "evidence": evidence_text,
+        "previous_queries": previous_queries_text
     })
 
-    # 强约束: 对 query 做 strip，为空时 fallback 到 original_question
     raw_query = result.get("query", "")
     next_query = raw_query.strip() if isinstance(raw_query, str) else ""
 
     metadata_updated = metadata.copy()
+
+    # 检查是否LLM认为信息已足够
+    if next_query.upper() == "DONE":
+        metadata_updated[f"hop_{current_hop}_decompose_done"] = True
+        metadata_updated["early_stop_signal"] = True
+        next_query = original_question
+
     if not next_query:
         next_query = original_question.strip()
         metadata_updated[f"hop_{current_hop}_decompose_fallback"] = True
-        metadata_updated[f"hop_{current_hop}_decompose_raw"] = result
 
     hop_queries_updated = hop_queries + [next_query]
 
@@ -607,7 +589,6 @@ def retrieve_hop_node(state: Hop2RagState) -> Dict[str, Any]:
 
     docs = custom_retriever.invoke(query)
 
-    # 把本 hop 使用的 query 写入 metadata
     metadata_updated = metadata.copy()
     metadata_updated[f"hop_{current_hop}_retrieve_query"] = query
 
@@ -618,90 +599,58 @@ def retrieve_hop_node(state: Hop2RagState) -> Dict[str, Any]:
     }
 
 
-@instrument_node("grade_documents_reranker")
-def grade_reranker_node(state: Hop2RagState) -> Dict[str, Any]:
-    """使用reranker批量评分文档"""
+@instrument_node("rerank_documents")
+def rerank_node(state: Hop2RagState) -> Dict[str, Any]:
+    """使用BM25重排序文档"""
     docs = state.get("documents", [])
     if not docs:
-        return {"document_scores": []}
+        return {"documents": [], "document_scores": []}
 
-    # 使用本 hop 的 hop_query 作为 rerank query，而非 state["question"]
     current_hop = state.get("current_hop", 0)
     hop_queries = state.get("hop_queries", [])
     original_question = state["question"]
     metadata = state.get("metadata", {})
 
-    # 获取本 hop 的 query；如果不存在则 fallback 到 original_question
     if current_hop < len(hop_queries):
         hop_query = hop_queries[current_hop]
     else:
         hop_query = original_question
 
-    # 构建 rerank_query：混合 original_question + hop_query
-    if hop_query != original_question:
-        rerank_query = f"{original_question} || {hop_query}"
-    else:
-        rerank_query = original_question
+    rerank_query = f"{original_question} {hop_query}"
 
-    reranker = get_reranker(threshold=0.3)
+    reranker = get_reranker()
     scored_docs = reranker.score_documents(rerank_query, docs)
 
-    # 把 raw_score 转成 yes/no，并生成 document_scores
-    document_scores = []
-    for doc, score in scored_docs:
-        binary_score = "yes" if score >= reranker.threshold else "no"
-        document_scores.append({
-            "document": doc,
-            "score": binary_score,
-            "raw_score": score
-        })
+    # 保留top文档
+    top_k = min(5, len(scored_docs))
+    kept_docs = [doc for doc, score in scored_docs[:top_k]]
 
-    # 把 rerank_query 写入 metadata
+    document_scores = [{"document": doc, "raw_score": score} for doc, score in scored_docs[:top_k]]
+
     metadata_updated = metadata.copy()
     metadata_updated[f"hop_{current_hop}_rerank_query"] = rerank_query
 
-    return {"document_scores": document_scores, "metadata": metadata_updated}
-
-
-@instrument_node("filter_relevant_documents_reranker")
-def filter_reranker_node(state: Hop2RagState) -> Dict[str, Any]:
-    """根据reranker评分结果过滤文档"""
-    # 取评分列表
-    # 每个元素：{"document": Document, "score": "yes"/"no", "raw_score": float}
-    scores = state.get("document_scores", [])
-    # 过滤：只保留 score == "yes" 的 Document
-    kept = [s["document"] for s in scores if s["score"] == "yes"]
-    # 只要过滤掉任何一个（存在 no），就认为有不相关文档。
-    has_irrelevant = len(kept) < len(scores)
-
     return {
-        "documents": kept,
-        "graded_relevant_docs": len(kept),
-        "has_irrelevant_docs": has_irrelevant
+        "documents": kept_docs,
+        "document_scores": document_scores,
+        "graded_relevant_docs": len(kept_docs),
+        "metadata": metadata_updated
     }
 
 
 @instrument_node("accumulate_graded_documents")
 def accumulate_node(state: Hop2RagState) -> Dict[str, Any]:
-    """
-        累积已评分的相关文档
-        把本 hop 过滤后的相关文档加入全局累计集合 all_graded_documents,
-        同时把本 hop 的文档列表追加到 hop_documents 里用于追踪。
-    """
+    """累积已评分的相关文档"""
     current_hop = state.get("current_hop", 0)
-    current_docs = state.get("documents", []) # 本 hop 的过滤后文档（来自 filter_reranker_node）
-    all_graded = state.get("all_graded_documents", []) # 之前 hop 累积的文档池
+    current_docs = state.get("documents", [])
+    all_graded = state.get("all_graded_documents", [])
     hop_documents = state.get("hop_documents", [])
 
-    # 去重：用 page_content 作为唯一键
-    # 避免跨 hop 重复把同一个 chunk 加进 all_graded_documents
+    # 去重累积，每hop最多加3篇
     existing_contents = {d.page_content for d in all_graded}
-    new_docs = [d for d in current_docs if d.page_content not in existing_contents]
-    all_graded_updated = all_graded + new_docs # 只追加去重后的 new_docs
+    new_docs = [d for d in current_docs[:3] if d.page_content not in existing_contents]
+    all_graded_updated = all_graded + new_docs
 
-    # 不去重，原样记录本 hop 的文档列表
-    # 用于后面分析每 hop 检索效果
-    # 画论文图/做 ablation（每跳召回文档变化）
     hop_documents_updated = hop_documents + [current_docs]
 
     return {
@@ -712,7 +661,7 @@ def accumulate_node(state: Hop2RagState) -> Dict[str, Any]:
 
 @instrument_node("extract_clues")
 def extract_clues_node(state: Hop2RagState) -> Dict[str, Any]:
-    """线索提取节点(保留LLM:推理核心)"""
+    """线索提取节点"""
     current_hop = state.get("current_hop", 0)
     question = state["question"]
     documents = state.get("documents", [])
@@ -720,12 +669,10 @@ def extract_clues_node(state: Hop2RagState) -> Dict[str, Any]:
     intermediate_answers = state.get("intermediate_answers", [])
 
     docs_text = "\n\n".join([
-        f"Doc {i+1}: {d.page_content[:300]}" # 每篇只取前 300 字符
-        for i, d in enumerate(documents[:10]) # 最多取 10 篇
+        f"Doc {i+1}: {d.page_content[:300]}"
+        for i, d in enumerate(documents[:10])
     ])
 
-    # 桥接的起点
-    # 桥接实体被“消费” —— decompose_node 已经用掉了
     extractor = get_clue_extractor()
     result = extractor.invoke({
         "question": question,
@@ -733,9 +680,8 @@ def extract_clues_node(state: Hop2RagState) -> Dict[str, Any]:
         "documents": docs_text
     })
 
-    clues = result.get("clues", []) # 实体/线索抽取器
-    summary = result.get("summary", "") # 本 hop 局部摘要器
-    # 把 LLM 输出变成 hop_evidence 的一条记录
+    clues = result.get("clues", [])
+    summary = result.get("summary", "")
     evidence_text = f"{', '.join(clues)} - {summary}" if clues else summary
 
     hop_evidence_updated = hop_evidence + [evidence_text]
@@ -749,13 +695,16 @@ def extract_clues_node(state: Hop2RagState) -> Dict[str, Any]:
 
 @instrument_node("decide_next_hop")
 def decide_node(state: Hop2RagState) -> Dict[str, Any]:
-    """跳数决策节点(保留LLM:Agentic核心)"""
+    """跳数决策节点"""
     current_hop = state.get("current_hop", 0)
-    max_hops = state.get("max_hops", 2)
+    max_hops = state.get("max_hops", 5)
     question = state["question"]
     hop_evidence = state.get("hop_evidence", [])
     all_docs = state.get("all_graded_documents", [])
     metadata = state.get("metadata", {})
+
+    # 检查decompose是否发出了提前停止信号
+    early_stop = metadata.get("early_stop_signal", False)
 
     evidence_text = "\n".join([f"Hop {i}: {ev}" for i, ev in enumerate(hop_evidence)])
 
@@ -768,12 +717,31 @@ def decide_node(state: Hop2RagState) -> Dict[str, Any]:
         "doc_count": len(all_docs)
     })
 
-    decision = result.get("decision", "no")
+    raw_decision_raw = result.get("decision", "no")
     reasoning = result.get("reasoning", "")
+
+    if isinstance(raw_decision_raw, str):
+        raw_decision = raw_decision_raw.strip().lower()
+    else:
+        raw_decision = "no"
+
+    if raw_decision not in ("yes", "no"):
+        raw_decision = "no"
+
+    # 决策逻辑
+    if current_hop >= max_hops - 1:
+        decision = "yes"  # 强制终止
+    elif early_stop or raw_decision == "yes":
+        decision = "yes"
+    else:
+        decision = "no"
 
     metadata_updated = metadata.copy()
     metadata_updated[f"hop_{current_hop}_decision"] = decision
+    metadata_updated[f"hop_{current_hop}_decision_raw"] = raw_decision_raw
     metadata_updated[f"hop_{current_hop}_reasoning"] = reasoning
+    if "early_stop_signal" in metadata_updated:
+        del metadata_updated["early_stop_signal"]
 
     next_hop = current_hop + 1
 
@@ -785,40 +753,51 @@ def decide_node(state: Hop2RagState) -> Dict[str, Any]:
 
 @instrument_node("generate_multi_hop_final")
 def generate_final_node(state: Hop2RagState) -> Dict[str, Any]:
-    """多跳最终生成节点(保留LLM:生成核心)"""
+    """多跳最终生成节点"""
     question = state["question"]
-    all_docs = state.get("all_graded_documents", [])
-    hop_queries = state.get("hop_queries", [])
     hop_evidence = state.get("hop_evidence", [])
+    hop_queries = state.get("hop_queries", [])
+    all_graded = state.get("all_graded_documents", [])
+    hop_documents = state.get("hop_documents", [])
+
+    # 构建证据文本
+    evidence_parts = []
+    for i, ev in enumerate(hop_evidence):
+        query = hop_queries[i] if i < len(hop_queries) else ""
+        evidence_parts.append(f"Hop {i} (Query: {query}):\n{ev}")
+    evidence_text = "\n\n".join(evidence_parts)
+
+    # 构建支撑文档（优先最后一跳 + 累积的top文档）
+    final_docs = []
+    if hop_documents:
+        final_docs.extend(hop_documents[-1][:3])
+    existing = {d.page_content for d in final_docs}
+    for d in all_graded:
+        if d.page_content not in existing and len(final_docs) < 6:
+            final_docs.append(d)
+            existing.add(d.page_content)
 
     context = "\n\n".join([
-        f"[Doc {i+1}] {d.page_content}"
-        for i, d in enumerate(all_docs)
+        f"[Doc {i+1}] {d.page_content[:500]}"
+        for i, d in enumerate(final_docs)
     ])
-
-    hop_history = []
-    for i in range(len(hop_queries)):
-        query = hop_queries[i] if i < len(hop_queries) else ""
-        evidence = hop_evidence[i] if i < len(hop_evidence) else ""
-        hop_history.append(f"Hop {i}: Query='{query}', Evidence='{evidence}'")
-    hop_history_text = "\n".join(hop_history)
 
     rag_chain = get_multi_hop_rag_chain()
     result = rag_chain.invoke({
         "question": question,
-        "context": context,
-        "hop_history": hop_history_text
+        "evidence": evidence_text,
+        "context": context
     })
 
     return {
         "generation": result,
-        "documents": all_docs
+        "documents": final_docs
     }
 
 
 @instrument_node("extract_supporting_facts_fast")
 def extract_sp_fast_node(state: Hop2RagState) -> Dict[str, Any]:
-    """使用sentence selector快速提取supporting facts"""
+    """使用BM25快速提取supporting facts"""
     question = state["question"]
     answer = state.get("generation", "")
     documents = state.get("documents", [])
@@ -837,15 +816,23 @@ def extract_sp_fast_node(state: Hop2RagState) -> Dict[str, Any]:
 @instrument_node("finalize")
 def finalize_node(state: Hop2RagState) -> Dict[str, Any]:
     """最终化输出"""
+    total_hops = state.get("current_hop", 0)
+    hop_queries = state.get("hop_queries", [])
+
+    existing_metadata = state.get("metadata", {})
+
+    final_metadata = {
+        **existing_metadata,
+        "data_source": state.get("data_source"),
+        "used_web_search": state.get("used_web_search", False),
+        "graded_relevant_docs": state.get("graded_relevant_docs", 0),
+        "total_hops": total_hops,
+        "hop_queries": hop_queries,
+    }
+
     return {
         "final_answer": state.get("generation", ""),
-        "metadata": {
-            "data_source": state.get("data_source"),
-            "used_web_search": state.get("used_web_search", False),
-            "graded_relevant_docs": state.get("graded_relevant_docs", 0),
-            "total_hops": state.get("current_hop", 0),
-            "hop_queries": state.get("hop_queries", []),
-        }
+        "metadata": final_metadata
     }
 
 
@@ -859,16 +846,9 @@ def should_continue_hop(state: Hop2RagState) -> str:
     current_hop = state.get("current_hop", 0)
     max_hops = state.get("max_hops", 5)
 
-    # 硬性限制检查
     if current_hop >= max_hops:
         return "finalize_answer"
 
-    # 文档检查
-    all_docs = state.get("all_graded_documents", [])
-    if len(all_docs) == 0 and current_hop > 0:
-        return "finalize_answer"
-
-    # LLM决策检查
     decision_key = f"hop_{current_hop - 1}_decision"
     decision = state.get("metadata", {}).get(decision_key, "no")
 
@@ -890,8 +870,7 @@ def build_hop2_rag() -> StateGraph:
     workflow.add_node("initialize", initialize_node)
     workflow.add_node("decompose", decompose_node)
     workflow.add_node("retrieve_hop", retrieve_hop_node)
-    workflow.add_node("grade_reranker", grade_reranker_node)
-    workflow.add_node("filter_docs", filter_reranker_node)
+    workflow.add_node("rerank", rerank_node)
     workflow.add_node("accumulate", accumulate_node)
     workflow.add_node("extract_clues", extract_clues_node)
     workflow.add_node("decide", decide_node)
@@ -905,9 +884,8 @@ def build_hop2_rag() -> StateGraph:
 
     # 跳数循环
     workflow.add_edge("decompose", "retrieve_hop")
-    workflow.add_edge("retrieve_hop", "grade_reranker")
-    workflow.add_edge("grade_reranker", "filter_docs")
-    workflow.add_edge("filter_docs", "accumulate")
+    workflow.add_edge("retrieve_hop", "rerank")
+    workflow.add_edge("rerank", "accumulate")
     workflow.add_edge("accumulate", "extract_clues")
     workflow.add_edge("extract_clues", "decide")
 
@@ -933,6 +911,35 @@ def get_hop2_rag_app():
     """获取编译后的Hop2Rag应用"""
     workflow = build_hop2_rag()
     return workflow.compile()
+
+
+def save_workflow_graph(output_path: str):
+    """保存工作流图到文件"""
+    try:
+        workflow = build_hop2_rag()
+        app = workflow.compile()
+
+        # 尝试使用 draw_mermaid_png
+        try:
+            png_data = app.get_graph().draw_mermaid_png()
+            with open(output_path, "wb") as f:
+                f.write(png_data)
+            return True
+        except Exception:
+            pass
+
+        # 尝试使用 draw_png
+        try:
+            png_data = app.get_graph().draw_png()
+            with open(output_path, "wb") as f:
+                f.write(png_data)
+            return True
+        except Exception:
+            pass
+
+        return False
+    except Exception:
+        return False
 
 
 # =============================
@@ -971,13 +978,11 @@ def run_hop2_rag(
         }
     }
 
-    # 测量总耗时
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
-    result = app.invoke(inputs)
+    result = app.invoke(inputs, config={"recursion_limit": 100})
     total_ms = (time.perf_counter() - start) * 1000
 
-    # 记录性能日志
     record = {
         "request_id": request_id,
         "total_ms": round(total_ms, 2),
@@ -1018,4 +1023,5 @@ if __name__ == "__main__":
     )
     print(f"Answer: {result['answer']}")
     print(f"Supporting Facts: {result['supporting_facts']}")
+    print(f"Total Hops: {result['metadata'].get('total_hops', 'N/A')}")
     print(f"Total Time: {result['timing_ms']:.2f}ms")
