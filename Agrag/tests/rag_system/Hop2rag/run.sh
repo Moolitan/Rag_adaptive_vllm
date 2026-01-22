@@ -6,18 +6,23 @@ python -m vllm.entrypoints.openai.api_server \
     --served-model-name Qwen2.5 \
     --dtype auto \
     --api-key EMPTY \
-    --tensor-parallel-size 1 \
-    --gpu-memory-utilization 0.9 \
     --port 8000
 
 export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_hotpotqa_fullwiki"                                                
 export AGRAG_COLLECTION_NAME="hotpotqa_fullwiki"   
 
 python tests/rag_system/Hop2rag/test_hop2rag_latency.py \
-        --limit 100 \
+        --limit 50 \
         --k 20 \
-        --max-hops 10 \
+        --max-hops 5 \
         --enable-instrumentation
+
+# 纯净版hop2rag测试
+python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
+        --limit 10 \
+        --k 10 \
+        --max-hops 5
+
 
 # 检查库是否有数据
 python - << 'PY'
@@ -32,3 +37,18 @@ for name in ["hotpot_fullwiki", "hotpotqa_fullwiki", "rag-chroma"]:
     except Exception as e:
         print(name, "ERROR", e)
 PY
+
+
+#实验一：KV Cache 复用潜力分析
+python tests/rag_system/Hop2rag/test_kv_cache_analysis.py  
+
+
+# 实验二：GPU 内存时序分析
+# vLLM 配置
+python -m vllm.entrypoints.openai.api_server \
+       --model /mnt/Large_Language_Model_Lab_1/模型/models/Qwen-Qwen2.5-7B-Instruct \
+       --served-model-name Qwen2.5 \
+       --port 8000 \
+       --disable-log-requests
+
+python tests/rag_system/Hop2rag/test_gpu_memory_profile.py --limit 10 --k 20 --max-hops 10 --sample-interval 10

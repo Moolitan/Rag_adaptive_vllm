@@ -9,6 +9,21 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langgraph.graph import StateGraph, START, END
 
+
+from runner.performancemonitor import DataCollector
+
+# 全局性能监控器实例
+monitor = DataCollector()
+
+def get_performance_records():
+    """获取性能监控记录"""
+    return monitor.records
+
+def clear_performance_records():
+    """清空性能监控记录"""
+    monitor.records.clear()
+    monitor.starts.clear()
+
 # =============================
 # 状态定义
 # =============================
@@ -757,7 +772,7 @@ def run_hop2_rag(
 
     result = app.invoke(
         inputs,
-        config={"recursion_limit": 100}
+        config={"recursion_limit": 100, "callbacks": [monitor]}
     )
 
 
@@ -765,6 +780,8 @@ def run_hop2_rag(
 
     # hop_evidence = result.get("hop_evidence", [])
     # hop_evidence_truncated = [ev[:200] if isinstance(ev, str) else str(ev)[:200] for ev in hop_evidence]
+
+
 
     # 返回结果
     return {
@@ -799,9 +816,9 @@ if __name__ == "__main__":
         k=10,
         max_hops=3
     )
-    print(f"Answer: {result['answer']}\n")
+    # print(f"Answer: {result['answer']}\n")
     # print(f"Supporting Facts: {result['supporting_facts']}\n")
     # for i in range(len(result['documents'])):
     #     pprint.pprint(f"Document {i+1} Content: {result['documents'][i].page_content[:200]}...")
     # print("\n")
-    print(f"current_hop: {result['current_hop']}")
+    # print(f"current_hop: {result['current_hop']}")
