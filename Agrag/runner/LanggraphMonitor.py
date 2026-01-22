@@ -75,40 +75,4 @@ class DataCollector(BaseCallbackHandler):
             }
             self.records.append(record)
 
-# ==============================================================================
-import requests
-import time
 
-VLLM_METRICS_URL = "http://localhost:8000/metrics"
-
-def check_vllm_status():
-    try:
-        response = requests.get(VLLM_METRICS_URL)
-        data = response.text
-        
-        # 解析你需要的数据，vLLM 返回的是 Prometheus 格式
-        metrics = {}
-        for line in data.split('\n'):
-            if line.startswith("#") or not line: continue
-            
-            # 示例：抓取正在运行的请求数
-            if "vllm:num_requests_running" in line:
-                metrics["running_reqs"] = float(line.split()[-1])
-            
-            # 示例：抓取 KV Cache 使用率 (显存相关)
-            if "vllm:gpu_cache_usage_perc" in line:
-                metrics["gpu_cache"] = float(line.split()[-1])
-                
-            # 示例：抓取 Token 生成速度
-            if "vllm:avg_generation_throughput_toks_per_s" in line:
-                metrics["gen_speed"] = float(line.split()[-1])
-
-        print(f"📊 vLLM Status: Running={metrics.get('running_reqs', 0)} | "
-              f"GPU Cache={metrics.get('gpu_cache', 0)*100:.1f}% | "
-              f"Speed={metrics.get('gen_speed', 0):.1f} tok/s")
-
-    except Exception as e:
-        print(f"无法连接 vLLM: {e}")
-
-# 你可以在 LangGraph 跑任务的时候，单独循环调用这个函数
-check_vllm_status()

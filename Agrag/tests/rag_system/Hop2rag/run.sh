@@ -4,10 +4,13 @@ conda activate langgraph_vllm
 python -m vllm.entrypoints.openai.api_server \
     --model /mnt/Large_Language_Model_Lab_1/模型/models/Qwen-Qwen2.5-7B-Instruct \
     --served-model-name Qwen2.5 \
+    --enable-prefix-caching \
+    --disable-log-requests \
     --dtype auto \
     --api-key EMPTY \
     --port 8000
 
+# 路径显示输出
 export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_hotpotqa_fullwiki"                                                
 export AGRAG_COLLECTION_NAME="hotpotqa_fullwiki"   
 
@@ -21,8 +24,11 @@ python tests/rag_system/Hop2rag/test_hop2rag_latency.py \
 python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
         --limit 10 \
         --k 10 \
+        --monitor-interval 0.5 \
         --max-hops 5
-
+        
+# 检查vllm性能指标是否正确
+curl -s http://localhost:8000/metrics | egrep "kv_cache|gpu_cache|cache_usage" | head
 
 # 检查库是否有数据
 python - << 'PY'

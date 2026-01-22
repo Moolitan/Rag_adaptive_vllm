@@ -17,6 +17,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
+from runner.VLLMMonitor import VLLMMonitor
+
 from Rag.hop2_rag_performancy import (
     run_hop2_rag,
     get_performance_records,
@@ -147,6 +149,7 @@ def main():
     ap.add_argument("--limit", type=int, default=5, help="Number of questions")
     ap.add_argument("--k", type=int, default=10, help="Retrieval K")
     ap.add_argument("--max-hops", type=int, default=3, help="Max hops")
+    ap.add_argument("--monitor-interval", type=float, default=0.5, help="Monitor polling interval")                                                                                   
     ap.add_argument("--verbose", action="store_true", help="Verbose output")
     args = ap.parse_args()
 
@@ -156,12 +159,24 @@ def main():
 
     # 示例问题
     questions = [
-        "Who is the director of the movie that won Best Picture at the 2020 Oscars?",
-        "What is the capital of the country where the Eiffel Tower is located?",
-        "Who wrote the novel that was adapted into the film Blade Runner?",
-        "What is the population of the city where the 2008 Summer Olympics were held?",
-        "Who is the CEO of the company that created the iPhone?",
-    ][:args.limit]
+        # "Were Scott Derrickson and Ed Wood of the same nationality?",
+        # "What government position was held by the woman who portrayed Corliss Archer in the film Kiss and Tell?",
+        "What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?",
+        # "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?",
+        "The director of the romantic comedy \"Big Stone Gap\" is based in what New York city?",
+        "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
+        # "Who was known by his stage name Aladin and helped organizations improve their performance as a consultant?",
+        "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
+        # "Who is older, Annie Morton or Terry Richardson?",
+        "Are Local H and For Against both from the United States?",
+        # "What is the name of the fight song of the university whose main campus is in Lawrence, Kansas and whose branch campuses are in the Kansas City metropolitan area?",
+        "What screenwriter with credits for \"Evolution\" co-wrote a film starring Nicolas Cage and Téa Leoni?",
+        # "What year did Guns N Roses perform a promo for a movie starring Arnold Schwarzenegger as a former New York Police detective?",
+        # "Are Random House Tower and 888 7th Avenue both used for real estate?",
+        # "The football manager who recruited David Beckham managed Manchester United during what timeframe?",
+        # "Brown State Fishing Lake is in a country that has a population of how many inhabitants ?",
+    ]
+    questions = questions[:min(args.limit, len(questions))]
 
     print("=" * 60)
     print("Hop2Rag Performance Test (DataCollector)")
@@ -170,8 +185,17 @@ def main():
     print(f"K: {args.k}, Max Hops: {args.max_hops}")
     print()
 
-    results = run_benchmark(questions, args.k, args.max_hops, args.verbose)
-    stats = compute_stats(results)
+    monitor = VLLMMonitor(
+            url="http://localhost:8000/metrics",
+            interval=args.monitor_interval,
+            csv_path=RESULTS_DIR / "vllm_metrics.csv",
+            flush_every = 1)
+    monitor.start() # 启动监控, 创建一个新的线程
+    try:
+        results = run_benchmark(questions, args.k, args.max_hops, args.verbose)
+        stats = compute_stats(results)
+    finally:
+        monitor.stop()
 
     print("\n" + "=" * 60)
     print("Statistics")
