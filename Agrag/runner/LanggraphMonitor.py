@@ -1,78 +1,329 @@
 import time
-from typing import Any, Dict, List
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
+
+class NodeType(str, Enum):
+    """节点类型"""
+    LLM = "llm"              # LLM 推理节点
+    RETRIEVER = "retriever"  # 向量库检索节点
+    CPU = "cpu"              # 非 LLM 的 CPU 计算节点
+
+
+# LLM 相关的节点名称（会调用 LLM）
+LLM_NODE_NAMES = {
+    "decompose",
+    "extract_clues",
+    "decide",
+    "generate_final",
+    "generate",
+}
+
+# 检索相关的节点名称
+RETRIEVER_NODE_NAMES = {
+    "retrieve",
+    "retrieve_hop",
+    "search",
+}
+
+
 class DataCollector(BaseCallbackHandler):
-    def __init__(self):
-        self.starts = {}
-        # 这里定义一个容器来存数据
-        self.records = [] 
+    """
+    LangGraph Node 级别的数据收集器。
 
-    # --- 监控 LLM 开始 ---
-    def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs: Any) -> None:
-        run_id = kwargs.get("run_id")
-        name = serialized.get("name") if serialized else None
-        self.starts[run_id] = {
-            "start_time": time.time(),
-            "type": "llm",
-            "name": name,
-            "prompt_preview": prompts[0][:50] if prompts else ""
-        }
+    特点：
+      - 只统计 LangGraph node 级别，不细分内部 chain
+      - 每个 node 有类型属性：llm / retriever / cpu
+      - 通过 langgraph_node 元数据识别真正的节点边界
+    """
 
-    # --- 监控 LLM 结束 ---
-    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
-        run_id = kwargs.get("run_id")
-        start_data = self.starts.pop(run_id, {})
-        end_time = time.time()
-        
-        # 提取生成内容
-        generation = response.generations[0][0].text
-        # 尝试提取 token usage (取决于 vLLM 是否返回)
-        usage = response.llm_output.get("token_usage", {}) if response.llm_output else {}
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+        # run_id -> 节点执行信息（用 run_id 作为 key 而不是 node_name）
+        self.active_runs: Dict[str, Dict[str, Any]] = {}
+        # run_id -> 所属的 node run_id（用于追踪嵌套关系）
+        self.run_to_parent: Dict[str, str] = {}
+        # 最终记录
+        self.records: List[Dict[str, Any]] = []
 
-        # 把整理好的数据存进 self.records
-        record = {
-            "event": "llm_call",
-            "model": start_data.get("name"),
-            "latency": end_time - start_data.get("start_time", end_time),
-            "timestamp": end_time,
-            "prompt": start_data.get("prompt_preview"),
-            "response": generation, # 这里拿到了 LLM 的回答
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0)
-        }
-        self.records.append(record)
+    def _safe_str(self, x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        try:
+            s = str(x)
+            return s if s else None
+        except Exception:
+            return None
 
-    # --- 监控 Tool/Node 开始 ---
+    def _get_langgraph_node(self, kwargs: Dict[str, Any]) -> Optional[str]:
+        """从 metadata 或 tags 中提取 langgraph node 名称"""
+        md = kwargs.get("metadata") or {}
+
+        # 检查多种可能的键名
+        candidate_keys = [
+            "langgraph_node",
+            "langgraph:node",
+            "langgraph.node",
+            "graph_node",
+            "node",
+            "node_name",
+            "name",
+        ]
+        for key in candidate_keys:
+            v = md.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        # 从 tags 中提取
+        tags = kwargs.get("tags") or []
+        for t in tags:
+            if not isinstance(t, str):
+                continue
+            for prefix in ("langgraph_node:", "langgraph:node:", "node:", "graph:"):
+                if t.startswith(prefix):
+                    name = t.split(":", 1)[1].strip()
+                    if name:
+                        return name
+
+        return None
+
+    def _classify_node_type(self, node_name: str) -> NodeType:
+        """根据节点名称判断节点类型"""
+        name_lower = node_name.lower()
+
+        for llm_name in LLM_NODE_NAMES:
+            if llm_name in name_lower:
+                return NodeType.LLM
+
+        for ret_name in RETRIEVER_NODE_NAMES:
+            if ret_name in name_lower:
+                return NodeType.RETRIEVER
+
+        return NodeType.CPU
+
+    def _find_node_run_id(self, run_id: str) -> Optional[str]:
+        """向上查找所属的节点 run_id"""
+        # 直接是节点
+        if run_id in self.active_runs:
+            return run_id
+        # 查找父节点
+        parent_id = self.run_to_parent.get(run_id)
+        if parent_id:
+            return self._find_node_run_id(parent_id)
+        return None
+
+    # ---------------------------
+    # Chain 回调
+    # ---------------------------
+
     def on_chain_start(self, serialized: Dict[str, Any], inputs: Dict[str, Any], **kwargs: Any) -> None:
-        run_id = kwargs.get("run_id")
-        # serialized 可能为 None
-        if serialized is None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if not run_id:
             return
-        name = serialized.get("name")
-        # 过滤掉 LangGraph 内部的一些杂项 chain，只关注主要的 Node
-        if name and "LangGraph" not in name:
-            self.starts[run_id] = {
-                "start_time": time.time(),
-                "type": "node",
-                "name": name
-            }
 
-    # --- 监控 Tool/Node 结束 ---
+        node_name = self._get_langgraph_node(kwargs)
+
+        if node_name:
+            # 这是一个 LangGraph node
+            node_type = self._classify_node_type(node_name)
+            self.active_runs[run_id] = {
+                "start_time": time.time(),
+                "node_name": node_name,
+                "node_type": node_type,
+                "has_llm_call": False,
+                "has_retriever_call": False,
+                "llm_latency": 0.0,
+                "retriever_latency": 0.0,
+                "doc_count": 0,
+            }
+            if self.debug:
+                print(f"[DEBUG] START node: {node_name}, type: {node_type.value}, run_id: {run_id[:8]}...")
+        else:
+            # 嵌套的 chain，记录父子关系
+            if parent_run_id:
+                self.run_to_parent[run_id] = parent_run_id
+
     def on_chain_end(self, outputs: Dict[str, Any], **kwargs: Any) -> None:
-        run_id = kwargs.get("run_id")
-        start_data = self.starts.pop(run_id, None)
-        if start_data: # 只有在 start 里记录过的才处理
+        run_id = self._safe_str(kwargs.get("run_id"))
+        if not run_id:
+            return
+
+        # 检查是否是一个节点的结束
+        if run_id in self.active_runs:
+            info = self.active_runs.pop(run_id)
             end_time = time.time()
+            latency = end_time - info["start_time"]
+
+            # 根据实际执行情况更新节点类型
+            actual_type = info["node_type"]
+            if info["has_llm_call"]:
+                actual_type = NodeType.LLM
+            elif info["has_retriever_call"]:
+                actual_type = NodeType.RETRIEVER
+
             record = {
                 "event": "node_execution",
-                "node_name": start_data["name"],
-                "latency": end_time - start_data["start_time"],
+                "node_name": info["node_name"],
+                "node_type": actual_type.value,
+                "latency": latency,
                 "timestamp": end_time,
-                # "outputs": outputs # 如果需要中间数据，可以取消注释
             }
+
+            if info["has_llm_call"]:
+                record["llm_latency"] = info["llm_latency"]
+
+            if info["has_retriever_call"]:
+                record["retriever_latency"] = info["retriever_latency"]
+                record["doc_count"] = info["doc_count"]
+
             self.records.append(record)
 
+            if self.debug:
+                print(f"[DEBUG] END node: {info['node_name']}, type: {actual_type.value}, latency: {latency*1000:.1f}ms")
+        else:
+            # 清理嵌套关系
+            if run_id in self.run_to_parent:
+                del self.run_to_parent[run_id]
 
+    # ---------------------------
+    # LLM 回调
+    # ---------------------------
+
+    def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if not run_id:
+            return
+
+        # 记录父子关系
+        if parent_run_id:
+            self.run_to_parent[run_id] = parent_run_id
+
+        # 找到所属的节点
+        node_run_id = self._find_node_run_id(parent_run_id) if parent_run_id else None
+
+        if node_run_id and node_run_id in self.active_runs:
+            self.active_runs[node_run_id]["llm_start_time"] = time.time()
+            if self.debug:
+                print(f"[DEBUG] llm_start: node={self.active_runs[node_run_id]['node_name']}")
+        elif self.debug:
+            print(f"[DEBUG] llm_start: parent_node=None (parent_run_id={parent_run_id[:8] if parent_run_id else None}...)")
+
+    def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if not run_id:
+            return
+
+        # 找到所属的节点
+        node_run_id = self._find_node_run_id(parent_run_id) if parent_run_id else None
+
+        if node_run_id and node_run_id in self.active_runs:
+            info = self.active_runs[node_run_id]
+            info["has_llm_call"] = True
+
+            if "llm_start_time" in info:
+                llm_latency = time.time() - info["llm_start_time"]
+                info["llm_latency"] += llm_latency
+                del info["llm_start_time"]
+
+        # 清理
+        if run_id in self.run_to_parent:
+            del self.run_to_parent[run_id]
+
+    # ---------------------------
+    # Retriever 回调
+    # ---------------------------
+
+    def on_retriever_start(self, serialized: Dict[str, Any], query: str, **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if not run_id:
+            return
+
+        if parent_run_id:
+            self.run_to_parent[run_id] = parent_run_id
+
+        node_run_id = self._find_node_run_id(parent_run_id) if parent_run_id else None
+
+        if node_run_id and node_run_id in self.active_runs:
+            self.active_runs[node_run_id]["retriever_start_time"] = time.time()
+            if self.debug:
+                print(f"[DEBUG] retriever_start: node={self.active_runs[node_run_id]['node_name']}")
+        elif self.debug:
+            print(f"[DEBUG] retriever_start: parent_node=None")
+
+    def on_retriever_end(self, documents: List[Any], **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if not run_id:
+            return
+
+        node_run_id = self._find_node_run_id(parent_run_id) if parent_run_id else None
+
+        if node_run_id and node_run_id in self.active_runs:
+            info = self.active_runs[node_run_id]
+            info["has_retriever_call"] = True
+            info["doc_count"] = len(documents) if documents else 0
+
+            if "retriever_start_time" in info:
+                retriever_latency = time.time() - info["retriever_start_time"]
+                info["retriever_latency"] += retriever_latency
+                del info["retriever_start_time"]
+
+        if run_id in self.run_to_parent:
+            del self.run_to_parent[run_id]
+
+    # ---------------------------
+    # Tool 回调
+    # ---------------------------
+
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        parent_run_id = self._safe_str(kwargs.get("parent_run_id"))
+        if run_id and parent_run_id:
+            self.run_to_parent[run_id] = parent_run_id
+
+    def on_tool_end(self, output: str, **kwargs: Any) -> None:
+        run_id = self._safe_str(kwargs.get("run_id"))
+        if run_id and run_id in self.run_to_parent:
+            del self.run_to_parent[run_id]
+
+    # ---------------------------
+    # 获取结果
+    # ---------------------------
+
+    def get_records(self) -> List[Dict[str, Any]]:
+        """获取所有记录"""
+        return self.records.copy()
+
+    def get_summary(self) -> Dict[str, Any]:
+        """获取统计摘要"""
+        total_latency = sum(r["latency"] for r in self.records)
+        llm_latency = sum(r.get("llm_latency", 0) for r in self.records)
+        retriever_latency = sum(r.get("retriever_latency", 0) for r in self.records)
+
+        llm_nodes = [r for r in self.records if r["node_type"] == NodeType.LLM.value]
+        retriever_nodes = [r for r in self.records if r["node_type"] == NodeType.RETRIEVER.value]
+        cpu_nodes = [r for r in self.records if r["node_type"] == NodeType.CPU.value]
+
+        return {
+            "total_nodes": len(self.records),
+            "total_latency_sec": total_latency,
+            "llm_nodes": len(llm_nodes),
+            "llm_latency_sec": llm_latency,
+            "retriever_nodes": len(retriever_nodes),
+            "retriever_latency_sec": retriever_latency,
+            "cpu_nodes": len(cpu_nodes),
+            "cpu_latency_sec": total_latency - llm_latency - retriever_latency,
+        }
+
+    def clear(self) -> None:
+        """清空所有记录"""
+        self.active_runs.clear()
+        self.run_to_parent.clear()
+        self.records.clear()

@@ -10,19 +10,23 @@ from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langgraph.graph import StateGraph, START, END
 
 
-from runner.performancemonitor import DataCollector
+from runner.LanggraphMonitor import DataCollector
 
 # 全局性能监控器实例
+# monitor = DataCollector(debug=True)
 monitor = DataCollector()
 
 def get_performance_records():
     """获取性能监控记录"""
-    return monitor.records
+    return monitor.get_records()
+
+def get_performance_summary():
+    """获取性能统计摘要"""
+    return monitor.get_summary()
 
 def clear_performance_records():
     """清空性能监控记录"""
-    monitor.records.clear()
-    monitor.starts.clear()
+    monitor.clear()
 
 # =============================
 # 状态定义

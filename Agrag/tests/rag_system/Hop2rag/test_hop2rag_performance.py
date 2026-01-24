@@ -38,11 +38,15 @@ class PerformanceResult:
     answer: str
     num_hops: int
     total_latency_sec: float
-    llm_calls: int
+    # 节点统计
+    total_nodes: int
+    llm_nodes: int
+    retriever_nodes: int
+    cpu_nodes: int
+    # 延迟统计
     total_llm_latency_sec: float
-    total_input_tokens: int
-    total_output_tokens: int
-    node_executions: int
+    total_retriever_latency_sec: float
+    # 详细记录
     records: List[Dict[str, Any]]
 
 
@@ -62,23 +66,26 @@ def run_single_test(question: str, k: int, max_hops: int) -> PerformanceResult:
 
     records = get_performance_records()
 
-    llm_records = [r for r in records if r.get("event") == "llm_call"]
-    node_records = [r for r in records if r.get("event") == "node_execution"]
+    # 按节点类型分类
+    llm_nodes = [r for r in records if r.get("node_type") == "llm"]
+    retriever_nodes = [r for r in records if r.get("node_type") == "retriever"]
+    cpu_nodes = [r for r in records if r.get("node_type") == "cpu"]
 
-    total_llm_latency = sum(r.get("latency", 0) for r in llm_records)
-    total_input_tokens = sum(r.get("input_tokens", 0) for r in llm_records)
-    total_output_tokens = sum(r.get("output_tokens", 0) for r in llm_records)
+    # 计算延迟
+    total_llm_latency = sum(r.get("llm_latency", 0) for r in llm_nodes)
+    total_retriever_latency = sum(r.get("retriever_latency", 0) for r in retriever_nodes)
 
     return PerformanceResult(
         question=question,
         answer=result.get("answer", ""),
         num_hops=result.get("current_hop", 0),
         total_latency_sec=total_latency,
-        llm_calls=len(llm_records),
+        total_nodes=len(records),
+        llm_nodes=len(llm_nodes),
+        retriever_nodes=len(retriever_nodes),
+        cpu_nodes=len(cpu_nodes),
         total_llm_latency_sec=total_llm_latency,
-        total_input_tokens=total_input_tokens,
-        total_output_tokens=total_output_tokens,
-        node_executions=len(node_records),
+        total_retriever_latency_sec=total_retriever_latency,
         records=list(records)
     )
 
@@ -96,8 +103,8 @@ def run_benchmark(questions: List[str], k: int, max_hops: int, verbose: bool = T
 
         if verbose:
             print(f"  Latency: {perf.total_latency_sec:.2f}s, "
-                  f"LLM calls: {perf.llm_calls}, "
-                  f"Tokens: {perf.total_input_tokens}+{perf.total_output_tokens}")
+                  f"Nodes: {perf.total_nodes} (LLM:{perf.llm_nodes}, Ret:{perf.retriever_nodes}, CPU:{perf.cpu_nodes}), "
+                  f"LLM time: {perf.total_llm_latency_sec:.2f}s")
 
     return results
 
@@ -109,9 +116,11 @@ def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
 
     latencies = [r.total_latency_sec for r in results]
     llm_latencies = [r.total_llm_latency_sec for r in results]
-    llm_calls = [r.llm_calls for r in results]
-    input_tokens = [r.total_input_tokens for r in results]
-    output_tokens = [r.total_output_tokens for r in results]
+    retriever_latencies = [r.total_retriever_latency_sec for r in results]
+    llm_nodes = [r.llm_nodes for r in results]
+    retriever_nodes = [r.retriever_nodes for r in results]
+    cpu_nodes = [r.cpu_nodes for r in results]
+    total_nodes = [r.total_nodes for r in results]
     hops = [r.num_hops for r in results]
 
     return {
@@ -120,9 +129,11 @@ def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
         "latency_p50": float(np.percentile(latencies, 50)),
         "latency_p95": float(np.percentile(latencies, 95)),
         "llm_latency_mean": float(np.mean(llm_latencies)),
-        "llm_calls_mean": float(np.mean(llm_calls)),
-        "input_tokens_mean": float(np.mean(input_tokens)),
-        "output_tokens_mean": float(np.mean(output_tokens)),
+        "retriever_latency_mean": float(np.mean(retriever_latencies)),
+        "total_nodes_mean": float(np.mean(total_nodes)),
+        "llm_nodes_mean": float(np.mean(llm_nodes)),
+        "retriever_nodes_mean": float(np.mean(retriever_nodes)),
+        "cpu_nodes_mean": float(np.mean(cpu_nodes)),
         "hops_mean": float(np.mean(hops)),
     }
 
@@ -161,16 +172,16 @@ def main():
     questions = [
         # "Were Scott Derrickson and Ed Wood of the same nationality?",
         # "What government position was held by the woman who portrayed Corliss Archer in the film Kiss and Tell?",
-        "What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?",
+        # "What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?",
         # "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?",
-        "The director of the romantic comedy \"Big Stone Gap\" is based in what New York city?",
+        # "The director of the romantic comedy \"Big Stone Gap\" is based in what New York city?",
         "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
         # "Who was known by his stage name Aladin and helped organizations improve their performance as a consultant?",
-        "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
+        # "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
         # "Who is older, Annie Morton or Terry Richardson?",
-        "Are Local H and For Against both from the United States?",
+        # "Are Local H and For Against both from the United States?",
         # "What is the name of the fight song of the university whose main campus is in Lawrence, Kansas and whose branch campuses are in the Kansas City metropolitan area?",
-        "What screenwriter with credits for \"Evolution\" co-wrote a film starring Nicolas Cage and Téa Leoni?",
+        # "What screenwriter with credits for \"Evolution\" co-wrote a film starring Nicolas Cage and Téa Leoni?",
         # "What year did Guns N Roses perform a promo for a movie starring Arnold Schwarzenegger as a former New York Police detective?",
         # "Are Random House Tower and 888 7th Avenue both used for real estate?",
         # "The football manager who recruited David Beckham managed Manchester United during what timeframe?",
