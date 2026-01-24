@@ -149,10 +149,12 @@ Evidence collected so far:
 
 
 Instructions:
-- Output "stop" ONLY if the evidence already contains all information needed to answer the original question confidently.
-- Output "continue" if any key entity/attribute is missing, unclear, or unsupported.
-- For bridge questions: ensure the bridge entity AND the final target information are both present.
-- For comparison questions: ensure both sides (A and B) and the comparable attribute are present.
+- Output "stop" if the current evidence is sufficient to answer the original question in a reasonable and coherent way,
+  even if some minor details might be missing.
+- Output "continue" only if a clearly important entity, attribute, or comparison target is missing or unclear,
+  and another retrieval is likely to meaningfully improve the answer.
+- If the evidence already forms a plausible answer path, prefer "stop" over "continue".
+- Avoid continuing solely for completeness or extra confirmation.
 
 Return JSON:
 {{"decision": "continue" or "stop", "reasoning": "brief justification"}}
@@ -336,7 +338,7 @@ def get_custom_retriever(persist_dir: str, collection_name: str, k: int = 10):
 
         embedding = HuggingFaceEmbeddings(
             model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
-            model_kwargs={'device': 'cuda'},
+            # model_kwargs={'device': 'cuda'},
             encode_kwargs={'normalize_embeddings': True},
         )
 
