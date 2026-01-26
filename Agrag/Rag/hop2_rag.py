@@ -3,12 +3,16 @@ import json
 import uuid
 import re
 import math
+import threading
+from contextvars import ContextVar
 from typing import TypedDict, List, Dict, Any, Tuple, Optional
 from pathlib import Path
 from functools import wraps
 from collections import Counter
 
 import numpy as np
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.outputs import LLMResult
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
@@ -76,6 +80,9 @@ class PerformanceTracker:
         self.file_handle = None
         self.jsonl_path = None
         self._enabled = False
+        # LLM prompt 记录
+        self._prompt_log_path = None
+        self._prompt_file_handle = None
 
     def enable(self, output_dir: str, filename: str = "hop2rag_timings.jsonl"):
         """启用性能追踪并设置输出目录"""
@@ -85,6 +92,9 @@ class PerformanceTracker:
         self.filename = filename
         self.jsonl_path = self.output_dir / self.filename
         self.file_handle = open(self.jsonl_path, "a", buffering=1<<20)
+        # 初始化 prompt 日志
+        self._prompt_log_path = self.output_dir / "llm_prompts.jsonl"
+        self._prompt_file_handle = open(self._prompt_log_path, "a", buffering=1<<20)
         self._enabled = True
 
     def disable(self):
@@ -98,18 +108,30 @@ class PerformanceTracker:
             self.file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.file_handle.flush()
 
+    def log_llm_prompt(self, record: Dict[str, Any]):
+        """记录一次 LLM 调用的 prompt 详情"""
+        if self._enabled and self._prompt_file_handle:
+            self._prompt_file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self._prompt_file_handle.flush()
+
     def clear_log(self):
         """清空日志文件"""
         if self.jsonl_path and self.jsonl_path.exists():
             self.close()
             self.jsonl_path.unlink()
+            if self._prompt_log_path and self._prompt_log_path.exists():
+                self._prompt_log_path.unlink()
             if self._enabled:
                 self.file_handle = open(self.jsonl_path, "a", buffering=1<<20)
+                self._prompt_file_handle = open(self._prompt_log_path, "a", buffering=1<<20)
 
     def close(self):
         if self.file_handle:
             self.file_handle.close()
             self.file_handle = None
+        if self._prompt_file_handle:
+            self._prompt_file_handle.close()
+            self._prompt_file_handle = None
 
     def __del__(self):
         self.close()
@@ -131,6 +153,28 @@ def disable_instrumentation():
 def clear_instrumentation_log():
     """清空性能日志"""
     _tracker.clear_log()
+
+
+def log_llm_call(request_id: str, node_name: str, hop: int, prompt: str, prompt_tokens: int = 0):
+    """
+    记录一次 LLM 调用的详细信息（用于 KV Cache 分析）
+
+    Args:
+        request_id: 请求 ID
+        node_name: 节点名称 (decompose, extract_clues, decide, generate)
+        hop: 当前 hop 数
+        prompt: 完整的 prompt 文本
+        prompt_tokens: prompt token 数量（如果已知）
+    """
+    record = {
+        "request_id": request_id,
+        "node_name": node_name,
+        "hop": hop,
+        "prompt": prompt,
+        "prompt_tokens": prompt_tokens,
+        "timestamp": time.time(),
+    }
+    _tracker.log_llm_prompt(record)
 
 
 def instrument_node(node_name: str):
@@ -172,6 +216,171 @@ def instrument_edge(edge_name: str):
             return result
         return wrapper
     return decorator
+
+
+# =============================
+# Usage Aggregator（按 request 级汇总 LLM usage）
+# =============================
+
+# 使用 ContextVar 实现并发安全的 request_id 绑定
+_current_request_id: ContextVar[Optional[str]] = ContextVar("current_request_id", default=None)
+
+
+class UsageAggregator:
+    """
+    按 request_id 聚合所有 LLM 调用的 token usage。
+    并发安全：使用 threading.Lock 保护内部字典。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._usage_data: Dict[str, Dict[str, Any]] = {}
+
+    def init_request(self, request_id: str):
+        """初始化一个请求的 usage 数据"""
+        with self._lock:
+            self._usage_data[request_id] = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "call_count": 0,
+                "has_real_usage": False,  # 是否有真实 usage 数据
+            }
+
+    def add_usage(self, request_id: str, prompt_tokens: int, completion_tokens: int, from_real_usage: bool = True):
+        """累加一次 LLM 调用的 usage"""
+        with self._lock:
+            if request_id not in self._usage_data:
+                self.init_request(request_id)
+            data = self._usage_data[request_id]
+            data["prompt_tokens"] += prompt_tokens
+            data["completion_tokens"] += completion_tokens
+            data["total_tokens"] += prompt_tokens + completion_tokens
+            data["call_count"] += 1
+            if from_real_usage:
+                data["has_real_usage"] = True
+
+    def get_aggregated_usage(self, request_id: str) -> Dict[str, Any]:
+        """获取聚合后的 usage，包含 token_source 字段"""
+        with self._lock:
+            if request_id not in self._usage_data:
+                return {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "token_source": "unknown",
+                    "llm_call_count": 0,
+                }
+            data = self._usage_data[request_id]
+            # 判断 token_source
+            if data["has_real_usage"]:
+                token_source = "usage"
+            elif data["call_count"] > 0:
+                token_source = "tokenizer_estimate"
+            else:
+                token_source = "unknown"
+            return {
+                "prompt_tokens": data["prompt_tokens"],
+                "completion_tokens": data["completion_tokens"],
+                "total_tokens": data["total_tokens"],
+                "token_source": token_source,
+                "llm_call_count": data["call_count"],
+            }
+
+    def cleanup_request(self, request_id: str):
+        """清理请求的 usage 数据（请求完成后调用）"""
+        with self._lock:
+            self._usage_data.pop(request_id, None)
+
+
+# 全局 Usage Aggregator 实例
+_usage_aggregator = UsageAggregator()
+
+
+class UsageCollectorCallback(BaseCallbackHandler):
+    """
+    LangChain Callback Handler：在每次 LLM 结束时捕获 usage 并累加到当前 request_id。
+    支持从多种位置提取 usage：response.usage / generation_info / response_metadata。
+    """
+
+    def __init__(self, aggregator: UsageAggregator):
+        super().__init__()
+        self.aggregator = aggregator
+
+    def on_llm_end(self, response: LLMResult, **kwargs) -> None:
+        """LLM 调用结束时捕获 usage"""
+        request_id = _current_request_id.get()
+        if not request_id:
+            return
+
+        prompt_tokens = 0
+        completion_tokens = 0
+        from_real_usage = False
+
+        # 尝试从多个位置提取 usage
+        # 1. 从 llm_output 提取（OpenAI 风格）
+        if response.llm_output:
+            token_usage = response.llm_output.get("token_usage", {})
+            if token_usage:
+                prompt_tokens = token_usage.get("prompt_tokens", 0)
+                completion_tokens = token_usage.get("completion_tokens", 0)
+                from_real_usage = True
+
+            # vLLM / OpenAI 可能使用 usage 字段
+            if not from_real_usage:
+                usage = response.llm_output.get("usage", {})
+                if usage:
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    from_real_usage = True
+
+        # 2. 从 generations 中的 generation_info / message.response_metadata 提取
+        if not from_real_usage and response.generations:
+            for gen_list in response.generations:
+                for gen in gen_list:
+                    # 尝试 generation_info
+                    gen_info = getattr(gen, "generation_info", {}) or {}
+                    usage = gen_info.get("usage", {}) or gen_info.get("token_usage", {})
+                    if usage:
+                        prompt_tokens += usage.get("prompt_tokens", 0)
+                        completion_tokens += usage.get("completion_tokens", 0)
+                        from_real_usage = True
+                        break
+
+                    # 尝试 message.response_metadata（ChatOpenAI 返回的 AIMessage）
+                    msg = getattr(gen, "message", None)
+                    if msg:
+                        resp_meta = getattr(msg, "response_metadata", {}) or {}
+                        usage = resp_meta.get("token_usage", {}) or resp_meta.get("usage", {})
+                        if usage:
+                            prompt_tokens += usage.get("prompt_tokens", 0)
+                            completion_tokens += usage.get("completion_tokens", 0)
+                            from_real_usage = True
+                            break
+
+                        # additional_kwargs
+                        add_kwargs = getattr(msg, "additional_kwargs", {}) or {}
+                        usage = add_kwargs.get("usage", {})
+                        if usage:
+                            prompt_tokens += usage.get("prompt_tokens", 0)
+                            completion_tokens += usage.get("completion_tokens", 0)
+                            from_real_usage = True
+                            break
+                if from_real_usage:
+                    break
+
+        # 累加到 aggregator
+        if prompt_tokens > 0 or completion_tokens > 0:
+            self.aggregator.add_usage(request_id, prompt_tokens, completion_tokens, from_real_usage)
+
+
+# 全局 callback 实例
+_usage_callback = UsageCollectorCallback(_usage_aggregator)
+
+
+def get_usage_callbacks() -> list:
+    """获取包含 usage 收集的 callbacks 列表"""
+    return [_usage_callback]
 
 
 # =============================
@@ -539,6 +748,19 @@ def decompose_node(state: Hop2RagState) -> Dict[str, Any]:
     evidence_text = "\n".join([f"Hop {i}: {ev}" for i, ev in enumerate(evidence)]) if evidence else "None"
     previous_queries_text = ", ".join([f'"{q}"' for q in hop_queries]) if hop_queries else "None"
 
+    # 构建 prompt 用于记录
+    prompt_text = QUESTION_DECOMPOSER_PROMPT.format(
+        current_hop=current_hop,
+        original_question=original_question,
+        evidence=evidence_text,
+        previous_queries=previous_queries_text
+    )
+
+    # 记录 LLM 调用（如果启用了 instrumentation）
+    request_id = _current_request_id.get()
+    if request_id:
+        log_llm_call(request_id, "decompose", current_hop, prompt_text)
+
     decomposer = get_question_decomposer()
     result = decomposer.invoke({
         "current_hop": current_hop,
@@ -673,6 +895,18 @@ def extract_clues_node(state: Hop2RagState) -> Dict[str, Any]:
         for i, d in enumerate(documents[:10])
     ])
 
+    # 构建 prompt 用于记录
+    prompt_text = CLUE_EXTRACTOR_PROMPT.format(
+        question=question,
+        current_hop=current_hop,
+        documents=docs_text
+    )
+
+    # 记录 LLM 调用
+    request_id = _current_request_id.get()
+    if request_id:
+        log_llm_call(request_id, "extract_clues", current_hop, prompt_text)
+
     extractor = get_clue_extractor()
     result = extractor.invoke({
         "question": question,
@@ -707,6 +941,20 @@ def decide_node(state: Hop2RagState) -> Dict[str, Any]:
     early_stop = metadata.get("early_stop_signal", False)
 
     evidence_text = "\n".join([f"Hop {i}: {ev}" for i, ev in enumerate(hop_evidence)])
+
+    # 构建 prompt 用于记录
+    prompt_text = HOP_DECISION_PROMPT.format(
+        question=question,
+        current_hop=current_hop,
+        max_hops=max_hops,
+        evidence=evidence_text,
+        doc_count=len(all_docs)
+    )
+
+    # 记录 LLM 调用
+    request_id = _current_request_id.get()
+    if request_id:
+        log_llm_call(request_id, "decide", current_hop, prompt_text)
 
     decision_chain = get_hop_decision_chain()
     result = decision_chain.invoke({
@@ -759,6 +1007,7 @@ def generate_final_node(state: Hop2RagState) -> Dict[str, Any]:
     hop_queries = state.get("hop_queries", [])
     all_graded = state.get("all_graded_documents", [])
     hop_documents = state.get("hop_documents", [])
+    current_hop = state.get("current_hop", 0)
 
     # 构建证据文本
     evidence_parts = []
@@ -781,6 +1030,18 @@ def generate_final_node(state: Hop2RagState) -> Dict[str, Any]:
         f"[Doc {i+1}] {d.page_content[:500]}"
         for i, d in enumerate(final_docs)
     ])
+
+    # 构建 prompt 用于记录
+    prompt_text = MULTI_HOP_RAG_PROMPT.format(
+        question=question,
+        evidence=evidence_text,
+        context=context
+    )
+
+    # 记录 LLM 调用
+    request_id = _current_request_id.get()
+    if request_id:
+        log_llm_call(request_id, "generate", current_hop, prompt_text)
 
     rag_chain = get_multi_hop_rag_chain()
     result = rag_chain.invoke({
@@ -967,14 +1228,17 @@ def run_hop2_rag(
         包含完整调试信息的字典:
         - answer: 最终答案
         - supporting_facts: 支撑事实
-        - metadata: 元数据
+        - metadata: 元数据（含 aggregated_usage）
         - documents: 最终使用的文档
-        - hop_evidence: 每跳提取的证据
+        - hop_evidence: 每跳提取的证据（截断）
         - intermediate_answers: 每跳的中间答案
         - hop_documents: 每跳检索的文档列表
         - timing_ms: 总耗时
+        - aggregated_usage: 真实 token usage 汇总
     """
     app = get_hop2_rag_app()
+
+    request_id = str(uuid.uuid4())
 
     inputs = {
         "question": question,
@@ -986,33 +1250,70 @@ def run_hop2_rag(
         }
     }
 
-    request_id = str(uuid.uuid4())
-    start = time.perf_counter()
-    result = app.invoke(inputs, config={"recursion_limit": 100})
-    total_ms = (time.perf_counter() - start) * 1000
+    # 初始化 usage 聚合并设置 contextvar
+    _usage_aggregator.init_request(request_id)
+    token = _current_request_id.set(request_id)
 
-    record = {
-        "request_id": request_id,
-        "total_ms": round(total_ms, 2),
-        "node_ms": {k: round(v, 2) for k, v in result.get("_timings_ms", {}).items()},
-        "edge_ms": {k: round(v, 2) for k, v in result.get("_edge_timings_ms", {}).items()},
-        "meta": {"k": k, "max_hops": max_hops, "question": question[:100]}
-    }
-    _tracker.log_request(record)
+    try:
+        start = time.perf_counter()
+        # 传入 callbacks 以收集 usage
+        result = app.invoke(
+            inputs,
+            config={
+                "recursion_limit": 100,
+                "callbacks": get_usage_callbacks(),
+            }
+        )
+        total_ms = (time.perf_counter() - start) * 1000
 
-    # 返回完整的调试信息
-    return {
-        "answer": result.get("final_answer", ""),
-        "supporting_facts": result.get("supporting_facts", []),
-        "metadata": result.get("metadata", {}),
-        "documents": result.get("documents", []),
-        # 新增: 调试信息
-        "hop_evidence": result.get("hop_evidence", []),
-        "intermediate_answers": result.get("intermediate_answers", []),
-        "hop_documents": result.get("hop_documents", []),
-        "hop_queries": result.get("metadata", {}).get("hop_queries", []),
-        "timing_ms": total_ms
-    }
+        # 获取聚合后的 usage
+        aggregated_usage = _usage_aggregator.get_aggregated_usage(request_id)
+
+        # 提取元数据
+        metadata = result.get("metadata", {})
+        total_hops = metadata.get("total_hops", 0)
+        hop_queries = metadata.get("hop_queries", [])
+
+        # 构造精简的 JSONL record（不包含大文本）
+        record = {
+            "request_id": request_id,
+            "total_ms": round(total_ms, 2),
+            "total_hops": total_hops,
+            "hop_queries": [q[:100] for q in hop_queries],  # 截断查询
+            "data_source": metadata.get("data_source", "unknown"),
+            "used_web_search": metadata.get("used_web_search", False),
+            "graded_relevant_docs": metadata.get("graded_relevant_docs", 0),
+            "aggregated_usage": aggregated_usage,
+            "node_ms": {nk: round(v, 2) for nk, v in result.get("_timings_ms", {}).items()},
+            "edge_ms": {ek: round(v, 2) for ek, v in result.get("_edge_timings_ms", {}).items()},
+            "config": {"k": k, "max_hops": max_hops},
+        }
+        _tracker.log_request(record)
+
+        # 将 aggregated_usage 加入 metadata
+        metadata["aggregated_usage"] = aggregated_usage
+
+        # 处理 hop_evidence（截断以避免大文本）
+        hop_evidence = result.get("hop_evidence", [])
+        hop_evidence_truncated = [ev[:200] if isinstance(ev, str) else str(ev)[:200] for ev in hop_evidence]
+
+        # 返回结果
+        return {
+            "answer": result.get("final_answer", ""),
+            "supporting_facts": result.get("supporting_facts", []),
+            "metadata": metadata,
+            "documents": result.get("documents", []),
+            "hop_evidence": hop_evidence_truncated,
+            "intermediate_answers": result.get("intermediate_answers", []),
+            "hop_documents": result.get("hop_documents", []),
+            "hop_queries": hop_queries,
+            "timing_ms": total_ms,
+            "aggregated_usage": aggregated_usage,
+        }
+    finally:
+        # 清理 contextvar 和 usage 数据
+        _current_request_id.reset(token)
+        _usage_aggregator.cleanup_request(request_id)
 
 
 if __name__ == "__main__":
