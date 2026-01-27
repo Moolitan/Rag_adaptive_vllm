@@ -1,10 +1,15 @@
 conda activate langgraph_vllm
 
+# 路径显示输出
+export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_hotpotqa_fullwiki"                                                
+export AGRAG_COLLECTION_NAME="hotpotqa_fullwiki"   
+
 # 基础启动命令
 nsys profile -o ../report.nsys-rep \
     --trace=cuda,nvtx \
     --trace-fork-before-exec=true \
     --cuda-graph-trace=node \
+    --nvtx-capture=layerwise \
     --force-overwrite true \
 python -m vllm.entrypoints.openai.api_server \
     --model /mnt/Large_Language_Model_Lab_1/模型/models/Qwen-Qwen2.5-7B-Instruct \
@@ -15,8 +20,15 @@ python -m vllm.entrypoints.openai.api_server \
     --dtype auto \
     --api-key EMPTY \
     --port 8000
+
+# 纯净版hop2rag测试
+python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
+            --limit 10 \
+            --k 10 \
+            --monitor-interval 0.5 \
+            --max-hops 10
+
 # 结束 profiling（关键）
-# 另开一个终端
 nsys sessions list
 nsys stop --session=profile-<>
 
@@ -34,28 +46,8 @@ nsys stats report.nsys-rep --report cuda_api_sum --format csv,column --output  A
 # CUDA 内存使用情况
 nsys stats report.nsys-rep --report cuda_memory_usage --format csv,column --output  Agrag/tests/results/hop2rag_performance/cuda_memory_usage.csv
 
-
-# 路径显示输出
-export AGRAG_PERSIST_DIR="/mnt/Large_Language_Model_Lab_1/chroma_db/chroma_db_hotpotqa_fullwiki"                                                
-export AGRAG_COLLECTION_NAME="hotpotqa_fullwiki"   
-
-
-
-# 纯净版hop2rag测试
-
-# nsys profile -o report.nsys-rep \
-#        --trace-fork-before-exec=true \
-#        --cuda-graph-trace=node \
-python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
-            --limit 10 \
-            --k 10 \
-            --monitor-interval 0.5 \
-            --max-hops 10
-
-        
+# 画图
 python tests/rag_system/Hop2rag/plot_gpu_execution.py 
-
-
 
 # 检查vllm性能指标是否正确
 curl -s http://localhost:8000/metrics | egrep "kv_cache|gpu_cache|cache_usage" | head

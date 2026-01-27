@@ -1,9 +1,3 @@
-"""
-SelfRag - 自我反思RAG实现（独立版本）
-流程：检索 → 文档反思 → 生成 → 生成反思 → 循环优化
-特点：带自我反思机制的检索和生成
-不依赖工厂模式，所有组件独立实现
-"""
 from typing import TypedDict, List, Dict, Any
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
