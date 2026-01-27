@@ -1,5 +1,5 @@
 conda activate rag_adaptive
-
+#vllm启动
 # 基础启动命令
 python -m vllm.entrypoints.openai.api_server \
     --model /mnt/Large_Language_Model_Lab_1/模型/models/Qwen-Qwen2.5-7B-Instruct \
@@ -11,7 +11,7 @@ python -m vllm.entrypoints.openai.api_server \
     --port 8000
 
 export AGRAG_FAISS_DIR="/mnt/Large_Language_Model_Lab_1/faiss_wiki_db"      
-
+export TAVILY_API_KEY="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"
 #纯净版测试
 python tests/rag_system/c_rag/test_c_rag_performance.py \
         --limit 10 \

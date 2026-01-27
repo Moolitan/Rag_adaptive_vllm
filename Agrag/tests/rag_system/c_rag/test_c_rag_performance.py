@@ -215,7 +215,7 @@ def main():
         # "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
         # "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
         # "What screenwriter with credits for Evolution co-wrote a film starring Nicolas Cage and Téa Leoni?",
-        "Which city is the  of China?"
+        # "Which city is the capital of China?"
     ]
 
     questions = questions[:min(args.limit, len(questions))]
@@ -246,13 +246,13 @@ def main():
     for k, v in stats.items():
         print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    path = [
-        r["node"]
-        for r in records
-        if r["event"] == "node_execution"
-    ]
+    # path = [
+    #     r["node"]
+    #     for r in records
+    #     if r["event"] == "node_execution"
+    # ]
 
-    print(" → ".join(path))
+    # print(" → ".join(path))
 
     save_results(results, stats, RESULTS_DIR)
 

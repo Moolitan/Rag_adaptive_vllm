@@ -90,13 +90,39 @@ def get_llm(json_mode: bool = False, temperature: float = 0):
 # =============================
 
 # 路由提示词
-ROUTER_PROMPT = """You are an expert at routing a user question to a vectorstore, web search, or general generation.
-Use the vectorstore for questions about: LLM agents, prompt engineering, adversarial attacks,
-LangGraph/LangChain RAG patterns, and anything likely covered by the local knowledge base.
-Use web-search for: current events, newly released papers, unknown entities, time-sensitive facts,
-or anything not likely in the local knowledge base.
-Return a JSON object with a single key 'datasource' equal to 'web_search' or 'vectorstore'.
-Question to route: {question}"""
+ROUTER_PROMPT = """You are an expert router deciding whether to answer a question using a local Wikipedia-based vectorstore or web search.
+
+The local vectorstore contains a large snapshot of Wikipedia, covering:
+- General world knowledge
+- Historical events
+- People, places, organizations
+- Science, technology, politics, culture, arts, sports
+- Well-established facts and concepts
+- Non-time-sensitive information
+
+Use the vectorstore for:
+- Questions about well-known people, places, events, or concepts
+- Historical facts or background information
+- Definitions, explanations, or descriptions
+- Scientific or technical concepts that are not cutting-edge
+- Questions that could reasonably be answered by Wikipedia
+- Ambiguous or underspecified questions that do NOT clearly require up-to-date information
+
+Use web search ONLY for:
+- Current or breaking news
+- Events or facts after the Wikipedia snapshot was created
+- Rapidly changing information (e.g., stock prices, elections in progress, live scores)
+- Newly released papers, products, or technologies
+- Information explicitly requiring "latest", "recent", "today", or real-time data
+
+If unsure, prefer the vectorstore.
+
+Return a JSON object with a single key "datasource" set to either "vectorstore" or "web_search".
+
+Question to route:
+{question}
+"""
+
 
 # RAG生成提示词
 RAG_PROMPT = """You are an assistant for question-answering tasks.
@@ -165,36 +191,43 @@ Return JSON {{"score": "yes" or "no"}}."""
 _retriever = None
 
 
-def get_retriever():
-    """延迟加载 FAISS retriever"""
-    global _retriever
-    if _retriever is None:
-        import os
-        from langchain_huggingface import HuggingFaceEmbeddings
-        from langchain_community.vectorstores import FAISS
+def get_retriever(debug: bool = False):
+    import os
+    from langchain_community.vectorstores import FAISS
+    from langchain_huggingface import HuggingFaceEmbeddings
 
-        faiss_dir = os.environ.get("AGRAG_FAISS_DIR")
+    faiss_dir = os.environ.get("AGRAG_FAISS_DIR")
+    if not faiss_dir:
+        raise RuntimeError("Please set AGRAG_FAISS_DIR")
 
-        if not faiss_dir:
-            raise RuntimeError("请设置环境变量 AGRAG_FAISS_DIR")
+    embedding = HuggingFaceEmbeddings(
+        model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
+        model_kwargs={"device": "cuda"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
 
-        # 与构建 FAISS 时完全一致的 embedding
-        embedding = HuggingFaceEmbeddings(
-            model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
-            model_kwargs={'device': 'cuda'},
-            encode_kwargs={'normalize_embeddings': True},
-        )
+    vectorstore = FAISS.load_local(
+        faiss_dir,
+        embedding,
+        allow_dangerous_deserialization=True,
+    )
 
-        # 加载已存在的 FAISS 向量库
-        vectorstore = FAISS.load_local(
-            faiss_dir,
-            embedding,
-            allow_dangerous_deserialization=True
-        )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
 
-        _retriever = vectorstore.as_retriever()
+    if debug:
+        def _debug_get_docs(query: str):
+            docs = retriever.get_relevant_documents(query)
+            print(f"[FAISS] query='{query}'")
+            print(f"[FAISS] retrieved {len(docs)} docs")
+            for i, d in enumerate(docs[:3]):
+                print(f"--- doc {i} ---")
+                print(d.page_content[:200])
+                print(d.metadata)
+            return docs
 
-    return _retriever
+        retriever.get_relevant_documents = _debug_get_docs  # monkey patch
+
+    return retriever
 
 
 
@@ -283,7 +316,7 @@ def analyze_question_node(state: CRagState) -> Dict[str, Any]:
 
 def retrieve_node(state: CRagState) -> Dict[str, Any]:
     """检索节点：从向量库检索"""
-    retriever = get_retriever()
+    retriever = get_retriever(debug = False)
     docs = retriever.invoke(state["question"])
     return {
         "documents": docs,
@@ -372,7 +405,9 @@ def generate_node(state: CRagState) -> Dict[str, Any]:
         "question": state["question"],
         "context": context
     })
-
+    # print("the llm 输出：")
+    # print(result)
+    # print("\n")
     return {"generation": result}
 
 
@@ -526,7 +561,14 @@ def run_c_rag(question: str) -> Dict[str, Any]:
         包含 final_answer 和 metadata 的字典
     """
     app = get_c_rag_app()
-    result = app.invoke({"question": question})
+    result = app.invoke(
+        {"question": question},
+        config={
+            "callbacks": [monitor],
+            "recursion_limit": 100
+        }
+    )
+
     return {
         "answer": result.get("final_answer", ""),
         "metadata": result.get("metadata", {}),
