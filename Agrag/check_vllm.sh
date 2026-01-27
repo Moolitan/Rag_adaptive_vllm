@@ -15,3 +15,8 @@ ps -ef | grep vllm | grep -v grep
 echo " "
 echo "=== GPU ==="
 nvidia-smi
+
+
+#vllm
+uv venv --python 3.12 --seed
+source .venv/bin/activate

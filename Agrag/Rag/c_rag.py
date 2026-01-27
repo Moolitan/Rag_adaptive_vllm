@@ -151,33 +151,36 @@ _retriever = None
 
 
 def get_retriever():
-    """延迟加载retriever"""
+    """延迟加载 FAISS retriever"""
     global _retriever
     if _retriever is None:
         import os
         from langchain_huggingface import HuggingFaceEmbeddings
-        from langchain_chroma import Chroma
+        from langchain_community.vectorstores import FAISS
 
-        persist_dir = os.environ.get("AGRAG_PERSIST_DIR")
-        collection_name = os.environ.get("AGRAG_COLLECTION_NAME")
+        faiss_dir = os.environ.get("AGRAG_FAISS_DIR")
 
-        if not persist_dir or not collection_name:
-            raise RuntimeError("请设置环境变量 AGRAG_PERSIST_DIR 和 AGRAG_COLLECTION_NAME")
+        if not faiss_dir:
+            raise RuntimeError("请设置环境变量 AGRAG_FAISS_DIR")
 
+        # 与构建 FAISS 时完全一致的 embedding
         embedding = HuggingFaceEmbeddings(
             model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
             model_kwargs={'device': 'cuda'},
             encode_kwargs={'normalize_embeddings': True},
         )
 
-        vectorstore = Chroma(
-            collection_name=collection_name,
-            persist_directory=persist_dir,
-            embedding_function=embedding,
+        # 加载已存在的 FAISS 向量库
+        vectorstore = FAISS.load_local(
+            faiss_dir,
+            embedding,
+            allow_dangerous_deserialization=True
         )
+
         _retriever = vectorstore.as_retriever()
 
     return _retriever
+
 
 
 # =============================
