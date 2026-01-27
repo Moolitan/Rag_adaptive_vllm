@@ -48,6 +48,10 @@ nsys stats report.nsys-rep --report cuda_memory_usage --format csv,column --outp
 
 # 画图
 python tests/rag_system/Hop2rag/plot_gpu_execution.py 
+# 绘制前缀命中率的图表                                                                                        
+python tests/rag_system/Hop2rag/plot_prefix_cache_hitrate.py \
+    --input tests/results/hop2rag_performance/vllm_metrics.csv \
+    --output tests/results/hop2rag_performance/plots/prefix_cache_hitrate.png   
 
 # 检查vllm性能指标是否正确
 curl -s http://localhost:8000/metrics | egrep "kv_cache|gpu_cache|cache_usage" | head

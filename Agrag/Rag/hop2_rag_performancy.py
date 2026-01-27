@@ -778,7 +778,8 @@ def run_hop2_rag(
 
     result = app.invoke(
         inputs,
-        config={"recursion_limit": 100, "callbacks": [monitor]}
+        config={"recursion_limit": 100}
+        # config={"recursion_limit": 100, "callbacks": [monitor]}
     )
 
 

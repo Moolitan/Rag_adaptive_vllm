@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, Any, List, Optional, Callable
+from pathlib import Path
 
 
 class Analyzer:
@@ -95,7 +96,7 @@ class GpuCacheAnalyzer(Analyzer):
 
 class CacheHintAnalyzer(Analyzer):
     """
-    只给出 “可能命中/可能重算” 的 hint,
+    只给出 "可能命中/可能重算" 的 hint,
     并把阈值做成可配置 + 输出到 CSV 便于后验校准。
     """
     name = "cache_hint"
@@ -114,7 +115,7 @@ class CacheHintAnalyzer(Analyzer):
         derived["cache_hit_threshold"] = self.hit_threshold
         derived["cache_recompute_threshold"] = self.recompute_threshold
 
-        # 只在确实发生了 prefill 时才谈“hint”
+        # 只在确实发生了 prefill 时才谈"hint"
         if dp > 0:
             if dp <= self.hit_threshold:
                 notes.append("✅ cache_hint_hit")
@@ -126,6 +127,46 @@ class CacheHintAnalyzer(Analyzer):
                 derived["cache_hint"] = "unknown"
         else:
             derived["cache_hint"] = "n/a"
+
+        return notes, derived
+
+
+class PrefixCacheAnalyzer(Analyzer):
+    """
+    分析前缀缓存命中率
+    """
+    name = "prefix_cache"
+
+    def analyze(self, current, deltas):
+        notes = []
+        derived = {}
+
+        # 累积的查询和命中数
+        queries_total = float(current.get("prefix_cache_queries", 0.0))
+        hits_total = float(current.get("prefix_cache_hits", 0.0))
+
+        # 增量
+        delta_queries = float(deltas.get("prefix_cache_queries", 0.0))
+        delta_hits = float(deltas.get("prefix_cache_hits", 0.0))
+
+        # 累积命中率
+        if queries_total > 0:
+            hitrate_cumulative = (hits_total / queries_total) * 100.0
+        else:
+            hitrate_cumulative = 0.0
+
+        # 增量命中率（本次采样周期内的命中率）
+        if delta_queries > 0:
+            hitrate_delta = (delta_hits / delta_queries) * 100.0
+        else:
+            hitrate_delta = 0.0
+
+        derived["prefix_cache_queries_total"] = queries_total
+        derived["prefix_cache_hits_total"] = hits_total
+        derived["prefix_cache_hitrate_cumulative"] = hitrate_cumulative
+        derived["prefix_cache_delta_queries"] = delta_queries
+        derived["prefix_cache_delta_hits"] = delta_hits
+        derived["prefix_cache_hitrate_delta"] = hitrate_delta
 
         return notes, derived
 
@@ -155,6 +196,8 @@ class VLLMMonitor:
         # 状态追踪
         self.last_prompt_tokens: Optional[float] = None
         self.last_gen_tokens: Optional[float] = None
+        self.last_prefix_cache_queries: Optional[float] = None
+        self.last_prefix_cache_hits: Optional[float] = None
 
         # Prometheus 指标定义(不同 vLLM 版本可能名字不同,改这里)
         self.METRICS: Dict[str, MetricSpec] = {
@@ -163,6 +206,8 @@ class VLLMMonitor:
             "running": MetricSpec("vllm:num_requests_running", reduce="last"),
             "waiting": MetricSpec("vllm:num_requests_waiting", reduce="last"),
             "gpu_cache": MetricSpec("vllm:kv_cache_usage_perc", reduce="last"),
+            "prefix_cache_queries": MetricSpec("vllm:prefix_cache_queries_total", reduce="sum"),
+            "prefix_cache_hits": MetricSpec("vllm:prefix_cache_hits_total", reduce="sum"),
         }
 
         # analyzers:可以自由增删/调整顺序
@@ -171,6 +216,7 @@ class VLLMMonitor:
             QueueAnalyzer(),
             GpuCacheAnalyzer(warn=0.80, high=0.90),
             CacheHintAnalyzer(hit_threshold=50.0, recompute_threshold=500.0),
+            PrefixCacheAnalyzer(),
         ]
 
         # CSV 实时写入
@@ -285,19 +331,27 @@ class VLLMMonitor:
     def _compute_deltas(self, current: Dict[str, float]) -> Optional[Dict[str, float]]:
         pt = float(current.get("prompt_total", 0.0))
         gt = float(current.get("gen_total", 0.0))
+        pcq = float(current.get("prefix_cache_queries", 0.0))
+        pch = float(current.get("prefix_cache_hits", 0.0))
 
         if self.last_prompt_tokens is None:
             self.last_prompt_tokens = pt
             self.last_gen_tokens = gt
+            self.last_prefix_cache_queries = pcq
+            self.last_prefix_cache_hits = pch
             return None
 
         deltas = {
             "prompt": pt - float(self.last_prompt_tokens),
             "gen": gt - float(self.last_gen_tokens),
+            "prefix_cache_queries": pcq - float(self.last_prefix_cache_queries),
+            "prefix_cache_hits": pch - float(self.last_prefix_cache_hits),
         }
 
         self.last_prompt_tokens = pt
         self.last_gen_tokens = gt
+        self.last_prefix_cache_queries = pcq
+        self.last_prefix_cache_hits = pch
         return deltas
 
     # ---------- analysis ----------
@@ -441,3 +495,5 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         mon.stop()
+
+
