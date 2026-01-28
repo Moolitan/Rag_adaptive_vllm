@@ -149,6 +149,64 @@ def plot_cumulative_hitrate(df: pd.DataFrame, output_path: str):
     plt.close()
 
 
+def plot_hitrate_delta(df: pd.DataFrame, output_path: str):
+    """
+    绘制命中率增量图（每个请求相对于前一个请求的命中率变化）
+
+    Args:
+        df: 聚合后的 DataFrame，包含 request_id 和 prefix_cache_hitrate_cumulative
+        output_path: 输出图片路径
+    """
+    if len(df) < 2:
+        print("⚠️  数据不足，无法计算命中率增量（至少需要2个请求）")
+        return
+
+    # 计算命中率增量
+    df = df.copy()
+    df['hitrate_delta'] = df['prefix_cache_hitrate_cumulative'].diff()
+
+    # 移除第一个请求（没有增量）
+    df_delta = df[df['request_id'] > df['request_id'].min()].copy()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # 使用不同颜色表示正负增量
+    colors = ['green' if x >= 0 else 'red' for x in df_delta['hitrate_delta']]
+
+    ax.bar(df_delta['request_id'], df_delta['hitrate_delta'],
+           color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+
+    # 添加零线
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+
+    ax.set_xlabel('Request ID', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Hit Rate Delta (%)', fontsize=14, fontweight='bold')
+    ax.set_title('Prefix Cache Hit Rate Delta (Change per Request)',
+                 fontsize=16, fontweight='bold', pad=20)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1, axis='y')
+
+    # 添加统计信息
+    mean_delta = df_delta['hitrate_delta'].mean()
+    max_delta = df_delta['hitrate_delta'].max()
+    min_delta = df_delta['hitrate_delta'].min()
+
+    stats_text = f"Mean Δ: {mean_delta:.2f}%\n"
+    stats_text += f"Max Δ: {max_delta:.2f}%\n"
+    stats_text += f"Min Δ: {min_delta:.2f}%"
+
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # 保存图片
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"📊 命中率增量图已保存到: {output_file}")
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="绘制前缀缓存命中率图表",
@@ -218,8 +276,12 @@ def main():
         print("⚠️  没有有效的请求数据")
         return
 
-    # 绘图
+    # 绘制累积命中率图
     plot_cumulative_hitrate(df_agg, args.output)
+
+    # 绘制命中率增量图
+    delta_output = args.output.replace('.png', '_delta.png')
+    plot_hitrate_delta(df_agg, delta_output)
 
     print("\n✅ 完成！")
 
