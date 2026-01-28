@@ -14,11 +14,19 @@ from runner.LanggraphMonitor import DataCollector
 
 # 全局性能监控器实例
 # monitor = DataCollector(debug=True)
-monitor = DataCollector()
+monitor = DataCollector(track_prompts=True, encoding_name="cl100k_base")
 
 def get_performance_records():
     """获取性能监控记录"""
     return monitor.get_records()
+
+def get_llm_calls():
+    """获取 LLM call 记录"""
+    return monitor.get_llm_calls()
+
+def get_prompt_token_distribution():
+    """获取 prompt token 分布统计"""
+    return monitor.get_prompt_token_distribution()
 
 def get_performance_summary():
     """获取性能统计摘要"""
@@ -778,8 +786,8 @@ def run_hop2_rag(
 
     result = app.invoke(
         inputs,
-        config={"recursion_limit": 100}
-        # config={"recursion_limit": 100, "callbacks": [monitor]}
+        # config={"recursion_limit": 100}
+        config={"recursion_limit": 100, "callbacks": [monitor]}
     )
 
 

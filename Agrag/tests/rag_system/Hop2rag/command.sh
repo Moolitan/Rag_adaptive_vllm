@@ -35,23 +35,22 @@ nsys stop --session=profile-<>
 # 使用nsys查看报告
 nsys stats --help
 nsys stats report.nsys-rep
-# kernel 级时间线
-nsys stats report.nsys-rep --report cuda_gpu_trace --format csv,column --output  Agrag/tests/results/hop2rag_performance/cuda_gpu_trace.csv
-# OSRT 级时间线
-nsys stats report.nsys-rep --report osrt_trace --format csv,column --output  Agrag/tests/results/hop2rag_performance/osrt_trace.csv
-# vLLM / NVTX 区间
-nsys stats report.nsys-rep --report nvtx_sum --format csv,column --output  Agrag/tests/results/hop2rag_performance/nvtx_sum.csv
-# cudaMalloc / sync 统计
-nsys stats report.nsys-rep --report cuda_api_sum --format csv,column --output  Agrag/tests/results/hop2rag_performance/api_summary.csv
-# CUDA 内存使用情况
-nsys stats report.nsys-rep --report cuda_memory_usage --format csv,column --output  Agrag/tests/results/hop2rag_performance/cuda_memory_usage.csv
 
-# 画图
-python tests/rag_system/Hop2rag/plot_gpu_execution.py 
-# 绘制前缀命中率的图表                                                                                        
+
+# 分析 Prompt Token 分布并获取建议的 Threshold
+python tests/rag_system/Hop2rag/analyze_prompt_distribution.py \
+    --input tests/results/hop2rag_performance/llm_calls.json \
+    --output tests/results/hop2rag_performance/plots/prompt_dist/prompt_dist \
+
+
+# 绘制自己写的Vllm监控器的前缀命中率的图表                                                                                        
 python tests/rag_system/Hop2rag/plot_prefix_cache_hitrate.py \
     --input tests/results/hop2rag_performance/vllm_metrics.csv \
-    --output tests/results/hop2rag_performance/plots/prefix_cache_hitrate.png   
+    --output tests/results/hop2rag_performance/plots/prefix_cache_hitrate.png 
+
+# 画nsys profile采样的图
+python tests/rag_system/Hop2rag/plot_gpu_execution.py 
+ 
 
 # 检查vllm性能指标是否正确
 curl -s http://localhost:8000/metrics | egrep "kv_cache|gpu_cache|cache_usage" | head
@@ -69,4 +68,18 @@ for name in ["hotpot_fullwiki", "hotpotqa_fullwiki", "rag-chroma"]:
     except Exception as e:
         print(name, "ERROR", e)
 PY
+
+
+
+# kernel 级时间线
+nsys stats report.nsys-rep --report cuda_gpu_trace --format csv,column --output  Agrag/tests/results/hop2rag_performance/cuda_gpu_trace.csv
+# OSRT 级时间线
+nsys stats report.nsys-rep --report osrt_trace --format csv,column --output  Agrag/tests/results/hop2rag_performance/osrt_trace.csv
+# vLLM / NVTX 区间
+nsys stats report.nsys-rep --report nvtx_sum --format csv,column --output  Agrag/tests/results/hop2rag_performance/nvtx_sum.csv
+# cudaMalloc / sync 统计
+nsys stats report.nsys-rep --report cuda_api_sum --format csv,column --output  Agrag/tests/results/hop2rag_performance/api_summary.csv
+# CUDA 内存使用情况
+nsys stats report.nsys-rep --report cuda_memory_usage --format csv,column --output  Agrag/tests/results/hop2rag_performance/cuda_memory_usage.csv
+
 

@@ -1,7 +1,7 @@
 """
-绘制前缀缓存命中率随请求变化的图表
+绘制前缀缓存命中率时间序列图
 
-从 VLLMMonitor 生成的 CSV 中读取数据，绘制命中率曲线
+直接使用 VLLMMonitor 采样的时间序列数据，不做请求聚合
 """
 
 import argparse
@@ -11,205 +11,167 @@ import numpy as np
 from pathlib import Path
 
 
-def detect_requests(df: pd.DataFrame, threshold: float = 100) -> pd.DataFrame:
+def plot_cumulative_hitrate(df: pd.DataFrame, output_path: str):
     """
-    检测请求边界，为每个请求分配 ID
-
-    当 delta_prompt > threshold 时，认为是新请求的开始
+    绘制累积命中率时间序列图
 
     Args:
         df: VLLMMonitor 生成的 DataFrame
-        threshold: 判断新请求的阈值（tokens）
-
-    Returns:
-        添加了 request_id 列的 DataFrame
-    """
-    request_id = 0
-    request_ids = []
-
-    for i, row in df.iterrows():
-        delta_prompt = row.get('delta_prompt', 0)
-        if delta_prompt > threshold:
-            request_id += 1
-        request_ids.append(request_id)
-
-    df['request_id'] = request_ids
-    return df
-
-
-def aggregate_by_request(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    按请求聚合数据
-
-    Args:
-        df: 包含 request_id 的 DataFrame
-
-    Returns:
-        每行代表一个请求的 DataFrame
-    """
-    # 过滤掉 request_id = 0（初始化阶段）
-    df = df[df['request_id'] > 0].copy()
-
-    if len(df) == 0:
-        return pd.DataFrame()
-
-    # 按 request_id 分组，取最后一个值（累积命中率）
-    grouped = df.groupby('request_id').agg({
-        'prefix_cache_hitrate_cumulative': 'last',
-        'prefix_cache_queries_total': 'last',
-        'prefix_cache_hits_total': 'last',
-    }).reset_index()
-
-    return grouped
-
-
-def plot_hitrate(df: pd.DataFrame, output_path: str, title: str = "Prefix Cache Hit Rate"):
-    """
-    绘制命中率曲线
-
-    Args:
-        df: 聚合后的 DataFrame，包含 request_id 和 prefix_cache_hitrate_cumulative
         output_path: 输出图片路径
-        title: 图表标题
     """
     if len(df) == 0:
         print("⚠️  没有数据可绘制")
         return
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # 过滤掉初始化阶段（命中率为 0 的点）和异常值（命中率 > 100%）
+    # df_plot = df[
+    #     (df['prefix_cache_hitrate_cumulative'] > 0) &
+    #     (df['prefix_cache_hitrate_cumulative'] <= 100)
+    # ].copy()
 
-    # 绘制命中率曲线
-    ax.plot(df['request_id'], df['prefix_cache_hitrate_cumulative'],
-            marker='o', linewidth=2, markersize=4, label='Cumulative Hit Rate')
+    df_plot = df.copy()
 
-    # 添加网格
-    ax.grid(True, alpha=0.3, linestyle='--')
-
-    # 设置标签
-    ax.set_xlabel('Request ID', fontsize=12)
-    ax.set_ylabel('Hit Rate (%)', fontsize=12)
-    ax.set_title(title, fontsize=14, fontweight='bold')
-
-    # 设置 y 轴范围
-    ax.set_ylim(0, 100)
-
-    # 添加图例
-    ax.legend(loc='lower right', fontsize=10)
-
-    # 添加统计信息
-    final_hitrate = df['prefix_cache_hitrate_cumulative'].iloc[-1]
-    total_queries = df['prefix_cache_queries_total'].iloc[-1]
-    total_hits = df['prefix_cache_hits_total'].iloc[-1]
-
-    stats_text = f"Final Hit Rate: {final_hitrate:.2f}%\n"
-    stats_text += f"Total Queries: {int(total_queries)} tokens\n"
-    stats_text += f"Total Hits: {int(total_hits)} tokens"
-
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-            fontsize=10, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-    # 保存图片
-    plt.tight_layout()
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"📊 图表已保存到: {output_file}")
-
-    plt.close()
-
-
-def plot_cumulative_hitrate(df: pd.DataFrame, output_path: str):
-    """绘制累积命中率图"""
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ax.plot(df['request_id'], df['prefix_cache_hitrate_cumulative'],
-            marker='o', linewidth=2.5, markersize=5, color='#2E86AB',
-            markerfacecolor='white', markeredgewidth=2)
-
-    ax.set_xlabel('Request ID', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Hit Rate (%)', fontsize=14, fontweight='bold')
-    ax.set_title('Prefix Cache Cumulative Hit Rate', fontsize=16, fontweight='bold', pad=20)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1)
-    ax.set_ylim(0, 105)
-
-    # 添加最终命中率标注
-    final_hitrate = df['prefix_cache_hitrate_cumulative'].iloc[-1]
-    ax.axhline(y=final_hitrate, color='red', linestyle='--', alpha=0.5, linewidth=1.5)
-    ax.text(df['request_id'].max() * 0.98, final_hitrate + 2,
-            f'Final: {final_hitrate:.2f}%',
-            ha='right', fontsize=12, color='red', fontweight='bold')
-
-    # 保存图片
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"📊 图表已保存到: {output_file}")
-    plt.close()
-
-
-def plot_hitrate_delta(df: pd.DataFrame, output_path: str):
-    """
-    绘制命中率增量图（每个请求相对于前一个请求的命中率变化）
-
-    Args:
-        df: 聚合后的 DataFrame，包含 request_id 和 prefix_cache_hitrate_cumulative
-        output_path: 输出图片路径
-    """
-    if len(df) < 2:
-        print("⚠️  数据不足，无法计算命中率增量（至少需要2个请求）")
+    if len(df_plot) == 0:
+        print("⚠️  没有有效数据（所有命中率都为 0）")
         return
 
-    # 计算命中率增量
-    df = df.copy()
-    df['hitrate_delta'] = df['prefix_cache_hitrate_cumulative'].diff()
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    # 移除第一个请求（没有增量）
-    df_delta = df[df['request_id'] > df['request_id'].min()].copy()
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot( range(len(df_plot)), df_plot['prefix_cache_hitrate_cumulative'],
+        marker='o', linewidth=2.5, markersize=5, color='#2E86AB',
+        markerfacecolor='white', markeredgewidth=2)
 
-    # 使用不同颜色表示正负增量
-    colors = ['green' if x >= 0 else 'red' for x in df_delta['hitrate_delta']]
+    # 设置标签和标题
+    ax.set_xlabel('Time (s)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Hit Rate (%)', fontsize=13, fontweight='bold')
+    ax.set_title('Prefix Cache Cumulative Hit Rate (Time Series)',
+                 fontsize=15, fontweight='bold', pad=20)
 
-    ax.bar(df_delta['request_id'], df_delta['hitrate_delta'],
-           color=colors, alpha=0.7, edgecolor='black', linewidth=0.5)
+    # 设置 y 轴范围
+    ax.set_ylim(0, 15)
 
-    # 添加零线
-    ax.axhline(y=0, color='black', linestyle='-', linewidth=1, alpha=0.5)
+    # 网格
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1)
+    ax.set_axisbelow(True)
 
-    ax.set_xlabel('Request ID', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Hit Rate Delta (%)', fontsize=14, fontweight='bold')
-    ax.set_title('Prefix Cache Hit Rate Delta (Change per Request)',
-                 fontsize=16, fontweight='bold', pad=20)
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1, axis='y')
+    # 添加最终命中率水平线
+    # 最终命中率
+    final_hitrate = df_plot['prefix_cache_hitrate_cumulative'].iloc[-1]
 
-    # 添加统计信息
-    mean_delta = df_delta['hitrate_delta'].mean()
-    max_delta = df_delta['hitrate_delta'].max()
-    min_delta = df_delta['hitrate_delta'].min()
+    # ① 画红色水平虚线
+    ax.axhline(
+        y=final_hitrate,
+        color='#e74c3c',
+        linestyle='--',
+        linewidth=2.5,
+        alpha=0.6
+    )
 
-    stats_text = f"Mean Δ: {mean_delta:.2f}%\n"
-    stats_text += f"Max Δ: {max_delta:.2f}%\n"
-    stats_text += f"Min Δ: {min_delta:.2f}%"
+    # ② 在线旁边标注文字
+    ax.annotate(
+        f'Final: {final_hitrate:.2f}%',
+        xy=(len(df_plot) - 1, final_hitrate),
+        xytext=(-5, 10),
+        textcoords='offset points',
+        ha='right',
+        va='bottom',
+        fontsize=11,
+        fontweight='bold',
+        color='#e74c3c',
+    )
 
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-            fontsize=10, verticalalignment='top',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
     # 保存图片
+    plt.tight_layout()
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"📊 累积命中率图已保存到: {output_file}")
+    plt.close()
+
+
+def plot_delta_hitrate(df: pd.DataFrame, output_path: str):
+    """
+    绘制增量命中率时间序列图
+
+    Args:
+        df: VLLMMonitor 生成的 DataFrame
+        output_path: 输出图片路径
+    """
+    if len(df) == 0:
+        print("⚠️  没有数据可绘制")
+        return
+
+    # 过滤掉没有增量的点（delta_queries = 0）和异常值（命中率 > 100%）
+    df_plot = df[
+        (df['prefix_cache_delta_queries'] > 0) &
+        (df['prefix_cache_hitrate_delta'] <= 100)
+    ].copy()
+
+    if len(df_plot) == 0:
+        print("⚠️  没有有效数据（所有增量都为 0）")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # 使用不同颜色表示不同命中率范围
+    colors = []
+    for rate in df_plot['prefix_cache_hitrate_delta']:
+        if rate >= 80:
+            colors.append('#2ecc71')  # 绿色：高命中率
+        elif rate >= 50:
+            colors.append('#f39c12')  # 橙色：中等命中率
+        else:
+            colors.append('#e74c3c')  # 红色：低命中率
+
+    # 绘制柱状图
+    ax.bar(range(len(df_plot)), df_plot['prefix_cache_hitrate_delta'],
+           color=colors, alpha=0.8, edgecolor='white', linewidth=0.5)
+
+    # 添加平均线
+    mean_rate = df_plot['prefix_cache_hitrate_delta'].mean()
+    ax.axhline(y=mean_rate, color='#34495e', linestyle='--',
+               linewidth=2, alpha=0.7, label=f'Mean: {mean_rate:.2f}%')
+
+    # 设置标签和标题
+    ax.set_xlabel('Time (ms)', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Hit Rate (%)', fontsize=13, fontweight='bold')
+    ax.set_title('Prefix Cache Delta Hit Rate (Time Series)',
+                 fontsize=15, fontweight='bold', pad=20)
+
+    # 设置 y 轴范围
+    ax.set_ylim(0, 105)
+
+    # 网格
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=1, axis='y')
+    ax.set_axisbelow(True)
+
+
+    # 添加颜色图例
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#2ecc71', alpha=0.8, label='High (≥80%)'),
+        Patch(facecolor='#f39c12', alpha=0.8, label='Medium (50-80%)'),
+        Patch(facecolor='#e74c3c', alpha=0.8, label='Low (<50%)'),
+        plt.Line2D([0], [0], color='#34495e', linestyle='--',
+                   linewidth=2, label=f'Mean: {mean_rate:.2f}%')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right',
+              framealpha=0.95, edgecolor='gray')
+
+    # 保存图片
     plt.tight_layout()
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"📊 命中率增量图已保存到: {output_file}")
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"📊 增量命中率图已保存到: {output_file}")
     plt.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="绘制前缀缓存命中率图表",
+        description="绘制前缀缓存命中率时间序列图",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
@@ -218,11 +180,9 @@ def main():
       --input tests/results/hop2rag_performance/vllm_metrics.csv \\
       --output tests/results/hop2rag_performance/plots/prefix_cache_hitrate.png
 
-  # 自定义请求检测阈值
-  python plot_prefix_cache_hitrate.py \\
-      --input vllm_metrics.csv \\
-      --output plots/hitrate.png \\
-      --threshold 200
+输出文件:
+  - prefix_cache_hitrate.png        (累积命中率时间序列)
+  - prefix_cache_hitrate_delta.png  (增量命中率时间序列)
         """
     )
 
@@ -240,13 +200,6 @@ def main():
         help='输出图片文件路径（PNG 格式）'
     )
 
-    parser.add_argument(
-        '--threshold',
-        type=float,
-        default=100,
-        help='判断新请求的阈值（delta_prompt > threshold）(默认: 100)'
-    )
-
     args = parser.parse_args()
 
     # 读取 CSV
@@ -255,33 +208,27 @@ def main():
     print(f"   总记录数: {len(df)}")
 
     # 检查必要的列
-    required_cols = ['delta_prompt', 'prefix_cache_hitrate_cumulative']
+    required_cols = [
+        'prefix_cache_hitrate_cumulative',
+        'prefix_cache_hitrate_delta',
+        'prefix_cache_queries_total',
+        'prefix_cache_hits_total',
+        'prefix_cache_delta_queries'
+    ]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
         print(f"❌ 错误: CSV 缺少必要的列: {missing_cols}")
         print(f"   可用的列: {list(df.columns)}")
         return
 
-    # 检测请求边界
-    print(f"🔍 检测请求边界 (threshold={args.threshold})...")
-    df = detect_requests(df, threshold=args.threshold)
-    print(f"   检测到 {df['request_id'].max()} 个请求")
-
-    # 按请求聚合
-    print("📊 按请求聚合数据...")
-    df_agg = aggregate_by_request(df)
-    print(f"   聚合后记录数: {len(df_agg)}")
-
-    if len(df_agg) == 0:
-        print("⚠️  没有有效的请求数据")
-        return
-
     # 绘制累积命中率图
-    plot_cumulative_hitrate(df_agg, args.output)
+    print(f"\n📊 绘制累积命中率图...")
+    plot_cumulative_hitrate(df, args.output)
 
-    # 绘制命中率增量图
-    delta_output = args.output.replace('.png', '_delta.png')
-    plot_hitrate_delta(df_agg, delta_output)
+    # # 绘制增量命中率图
+    # print(f"\n📊 绘制增量命中率图...")
+    # delta_output = args.output.replace('.png', '_delta.png')
+    # plot_delta_hitrate(df, delta_output)
 
     print("\n✅ 完成！")
 

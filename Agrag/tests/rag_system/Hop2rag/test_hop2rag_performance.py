@@ -22,6 +22,8 @@ from runner.VLLMMonitor import VLLMMonitor
 from Rag.hop2_rag_performancy import (
     run_hop2_rag,
     get_performance_records,
+    get_llm_calls,
+    get_prompt_token_distribution,
     clear_performance_records,
 )
 
@@ -94,6 +96,9 @@ def run_benchmark(questions: List[str], k: int, max_hops: int, verbose: bool = T
     """运行批量测试"""
     results = []
 
+    # 收集所有 LLM calls（跨所有请求）
+    all_llm_calls = []
+
     for i, q in enumerate(questions):
         if verbose:
             print(f"[{i+1}/{len(questions)}] {q[:60]}...")
@@ -101,12 +106,16 @@ def run_benchmark(questions: List[str], k: int, max_hops: int, verbose: bool = T
         perf = run_single_test(q, k, max_hops)
         results.append(perf)
 
+        # 收集当前请求的 LLM calls
+        llm_calls = get_llm_calls()
+        all_llm_calls.extend(llm_calls)
+
         if verbose:
             print(f"  Latency: {perf.total_latency_sec:.2f}s, "
                   f"Nodes: {perf.total_nodes} (LLM:{perf.llm_nodes}, Ret:{perf.retriever_nodes}, CPU:{perf.cpu_nodes}), "
                   f"LLM time: {perf.total_llm_latency_sec:.2f}s")
 
-    return results
+    return results, all_llm_calls
 
 
 def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
@@ -138,7 +147,7 @@ def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
     }
 
 
-def save_results(results: List[PerformanceResult], stats: Dict[str, Any], output_dir: Path):
+def save_results(results: List[PerformanceResult], stats: Dict[str, Any], llm_calls: List[Dict[str, Any]], output_dir: Path):
     """保存结果"""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,7 +161,32 @@ def save_results(results: List[PerformanceResult], stats: Dict[str, Any], output
     with open(stats_file, 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
+    # 保存 LLM calls 和 prompt token 分布
+    llm_calls_file = output_dir / "llm_calls.json"
+    token_counts = [call.get("prompt_tokens", 0) for call in llm_calls if call.get("prompt_tokens", 0) > 0]
+
+    llm_data = {
+        "llm_calls": llm_calls,
+        "distribution": {
+            "total_calls": len(llm_calls),
+            "total_tokens": sum(token_counts),
+            "min_tokens": min(token_counts) if token_counts else 0,
+            "max_tokens": max(token_counts) if token_counts else 0,
+            "mean_tokens": sum(token_counts) / len(token_counts) if token_counts else 0,
+            "median_tokens": sorted(token_counts)[len(token_counts) // 2] if token_counts else 0,
+            "token_counts": token_counts,
+        }
+    }
+
+    with open(llm_calls_file, 'w', encoding='utf-8') as f:
+        json.dump(llm_data, f, ensure_ascii=False, indent=2)
+
     print(f"\nResults saved to: {output_dir}")
+    print(f"  - performance_results.json: {len(results)} requests")
+    print(f"  - performance_stats.json: aggregated statistics")
+    print(f"  - llm_calls.json: {len(llm_calls)} LLM calls")
+    if token_counts:
+        print(f"    Token distribution: min={min(token_counts)}, max={max(token_counts)}, mean={sum(token_counts)/len(token_counts):.1f}")
 
 
 def main():
@@ -195,7 +229,7 @@ def main():
     print(f"Questions: {len(questions)}")
     print(f"K: {args.k}, Max Hops: {args.max_hops}")
     print()
-
+    print("monitor_interval:", args.monitor_interval)
     monitor = VLLMMonitor(
             url="http://localhost:8000/metrics",
             interval=args.monitor_interval,
@@ -203,7 +237,7 @@ def main():
             flush_every = 1)
     monitor.start() # 启动监控, 创建一个新的线程
     try:
-        results = run_benchmark(questions, args.k, args.max_hops, args.verbose)
+        results, all_llm_calls = run_benchmark(questions, args.k, args.max_hops, args.verbose)
         stats = compute_stats(results)
     finally:
         monitor.stop()
@@ -214,7 +248,7 @@ def main():
     for k, v in stats.items():
         print(f"  {k}: {v:.2f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    save_results(results, stats, RESULTS_DIR)
+    save_results(results, stats, all_llm_calls, RESULTS_DIR)
 
 
 if __name__ == "__main__":

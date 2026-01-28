@@ -5,6 +5,12 @@ from typing import Any, Dict, List, Optional
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
 
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+
 
 class NodeType(str, Enum):
     """节点类型"""
@@ -38,16 +44,30 @@ class DataCollector(BaseCallbackHandler):
       - 只统计 LangGraph node 级别，不细分内部 chain
       - 每个 node 有类型属性：llm / retriever / cpu
       - 通过 langgraph_node 元数据识别真正的节点边界
+      - 记录每个 LLM call 的 prompt 和 token 数量
     """
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, track_prompts: bool = True, encoding_name: str = "cl100k_base"):
         self.debug = debug
+        self.track_prompts = track_prompts
         # run_id -> 节点执行信息（用 run_id 作为 key 而不是 node_name）
         self.active_runs: Dict[str, Dict[str, Any]] = {}
         # run_id -> 所属的 node run_id（用于追踪嵌套关系）
         self.run_to_parent: Dict[str, str] = {}
         # 最终记录
         self.records: List[Dict[str, Any]] = []
+        # LLM call 记录（每个 LLM 调用的详细信息）
+        self.llm_calls: List[Dict[str, Any]] = []
+
+        # 初始化 tokenizer
+        self.tokenizer = None
+        if TIKTOKEN_AVAILABLE and track_prompts:
+            try:
+                self.tokenizer = tiktoken.get_encoding(encoding_name)
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Failed to load tiktoken encoding '{encoding_name}': {e}")
+                self.tokenizer = None
 
     def _safe_str(self, x: Any) -> Optional[str]:
         if x is None:
@@ -57,6 +77,18 @@ class DataCollector(BaseCallbackHandler):
             return s if s else None
         except Exception:
             return None
+
+    def _count_tokens(self, text: str) -> int:
+        """统计文本的 token 数量"""
+        if not text:
+            return 0
+        if self.tokenizer:
+            try:
+                return len(self.tokenizer.encode(text))
+            except Exception:
+                pass
+        # 如果没有 tokenizer，使用简单估算（1 token ≈ 4 字符）
+        return len(text) // 4
 
     def _get_langgraph_node(self, kwargs: Dict[str, Any]) -> Optional[str]:
         """从 metadata 或 tags 中提取 langgraph node 名称"""
@@ -206,11 +238,30 @@ class DataCollector(BaseCallbackHandler):
         # 找到所属的节点
         node_run_id = self._find_node_run_id(parent_run_id) if parent_run_id else None
 
+        # 记录 LLM call 的详细信息
+        if self.track_prompts and prompts:
+            # 合并所有 prompts（通常只有一个）
+            full_prompt = "\n".join(prompts)
+            prompt_tokens = self._count_tokens(full_prompt)
+
+            llm_call_info = {
+                "run_id": run_id,
+                "node_run_id": node_run_id,
+                "node_name": self.active_runs[node_run_id]["node_name"] if node_run_id and node_run_id in self.active_runs else None,
+                "prompt": full_prompt if len(full_prompt) < 10000 else full_prompt[:10000] + "...[truncated]",  # 限制长度
+                "prompt_tokens": prompt_tokens,
+                "timestamp": time.time(),
+            }
+            self.llm_calls.append(llm_call_info)
+
+            if self.debug:
+                print(f"[DEBUG] llm_call: node={llm_call_info['node_name']}, tokens={prompt_tokens}")
+
         if node_run_id and node_run_id in self.active_runs:
             self.active_runs[node_run_id]["llm_start_time"] = time.time()
-            if self.debug:
+            if self.debug and not self.track_prompts:
                 print(f"[DEBUG] llm_start: node={self.active_runs[node_run_id]['node_name']}")
-        elif self.debug:
+        elif self.debug and not self.track_prompts:
             print(f"[DEBUG] llm_start: parent_node=None (parent_run_id={parent_run_id[:8] if parent_run_id else None}...)")
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
@@ -301,6 +352,36 @@ class DataCollector(BaseCallbackHandler):
         """获取所有记录"""
         return self.records.copy()
 
+    def get_llm_calls(self) -> List[Dict[str, Any]]:
+        """获取所有 LLM call 记录"""
+        return self.llm_calls.copy()
+
+    def get_prompt_token_distribution(self) -> Dict[str, Any]:
+        """获取 prompt token 分布统计"""
+        if not self.llm_calls:
+            return {
+                "total_calls": 0,
+                "total_tokens": 0,
+                "min_tokens": 0,
+                "max_tokens": 0,
+                "mean_tokens": 0,
+                "median_tokens": 0,
+                "token_counts": [],
+            }
+
+        token_counts = [call["prompt_tokens"] for call in self.llm_calls]
+        token_counts_sorted = sorted(token_counts)
+
+        return {
+            "total_calls": len(self.llm_calls),
+            "total_tokens": sum(token_counts),
+            "min_tokens": min(token_counts),
+            "max_tokens": max(token_counts),
+            "mean_tokens": sum(token_counts) / len(token_counts),
+            "median_tokens": token_counts_sorted[len(token_counts_sorted) // 2],
+            "token_counts": token_counts,
+        }
+
     def get_summary(self) -> Dict[str, Any]:
         """获取统计摘要"""
         total_latency = sum(r["latency"] for r in self.records)
@@ -327,3 +408,4 @@ class DataCollector(BaseCallbackHandler):
         self.active_runs.clear()
         self.run_to_parent.clear()
         self.records.clear()
+        self.llm_calls.clear()

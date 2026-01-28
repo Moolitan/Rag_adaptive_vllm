@@ -132,33 +132,56 @@ class CacheHintAnalyzer(Analyzer):
 
 
 class PrefixCacheAnalyzer(Analyzer):
-    """
-    分析前缀缓存命中率
-    """
+
     name = "prefix_cache"
 
     def analyze(self, current, deltas):
+
         notes = []
         derived = {}
 
-        # 累积的查询和命中数
+        # 只要有新的请求进入prefill阶段，就把新请求的查询累加
+        # 增加的数量 = prompt 的 token 数，尝试查询就算 query
+        # prefix_cache_queries = 所有请求的 prompt token 总数
         queries_total = float(current.get("prefix_cache_queries", 0.0))
+
+        # 成功从 prefix cache 中复用的 token 数
+        # 也是会不断累加的
         hits_total = float(current.get("prefix_cache_hits", 0.0))
 
-        # 增量
+        # 增量（本次采样周期内的变化量）
+        # 例如：上次采样 queries=1000，本次 queries=1500，则 delta_queries=500
         delta_queries = float(deltas.get("prefix_cache_queries", 0.0))
         delta_hits = float(deltas.get("prefix_cache_hits", 0.0))
 
-        # 累积命中率
+
+        # 命中数不能大于查询数（这在逻辑上是不可能的）
+        # 如果出现这种情况，说明 vLLM 的 metrics 数据异常
+        if hits_total > queries_total and queries_total > 0:
+            # 修正：将 hits 限制为不超过 queries
+            hits_total = queries_total
+
+        if delta_hits > delta_queries and delta_queries > 0:
+            # 修正：将增量 hits 限制为不超过增量 queries
+            delta_hits = delta_queries
+
+        # 累积命中率 = 总命中数 / 总查询数
+        # 反映从启动到现在的整体缓存效果
         if queries_total > 0:
             hitrate_cumulative = (hits_total / queries_total) * 100.0
         else:
+            # 初始化阶段或空闲期，还没有任何查询
             hitrate_cumulative = 0.0
 
-        # 增量命中率（本次采样周期内的命中率）
+        # 增量命中率 = 本次命中数 / 本次查询数
+        # 反映当前时刻的实时缓存效果，比累积命中率更敏感
         if delta_queries > 0:
             hitrate_delta = (delta_hits / delta_queries) * 100.0
         else:
+            # 本次采样周期内没有新的查询
+            # 可能原因：
+            # 1. 系统空闲
+            # 2. 只有 decode 阶段（生成 token），没有 prefill 阶段
             hitrate_delta = 0.0
 
         derived["prefix_cache_queries_total"] = queries_total
@@ -167,6 +190,7 @@ class PrefixCacheAnalyzer(Analyzer):
         derived["prefix_cache_delta_queries"] = delta_queries
         derived["prefix_cache_delta_hits"] = delta_hits
         derived["prefix_cache_hitrate_delta"] = hitrate_delta
+
 
         return notes, derived
 
@@ -213,9 +237,9 @@ class VLLMMonitor:
         # analyzers:可以自由增删/调整顺序
         self.analyzers: List[Analyzer] = [
             TokenRateAnalyzer(interval_s=self.interval),
-            QueueAnalyzer(),
-            GpuCacheAnalyzer(warn=0.80, high=0.90),
-            CacheHintAnalyzer(hit_threshold=50.0, recompute_threshold=500.0),
+            # QueueAnalyzer(),
+            # GpuCacheAnalyzer(warn=0.80, high=0.90),
+            # CacheHintAnalyzer(hit_threshold=50.0, recompute_threshold=500.0),
             PrefixCacheAnalyzer(),
         ]
 
@@ -419,10 +443,11 @@ class VLLMMonitor:
         csv_dir = os.path.dirname(os.path.abspath(self.csv_path))
         os.makedirs(csv_dir, exist_ok=True)
 
-        self._csv_f = open(self.csv_path, "a", newline="", encoding="utf-8")
+        # 使用 "w" 模式覆盖写，而不是 "a" 追加写
+        self._csv_f = open(self.csv_path, "w", newline="", encoding="utf-8")
         # writer 需要 fieldnames,首次写入时再确定
         self._csv_writer = None
-        self._csv_header_written = os.path.getsize(self.csv_path) > 0
+        self._csv_header_written = False  # 新文件，表头未写入
         self._rows_since_flush = 0
 
     def _close_csv(self):
