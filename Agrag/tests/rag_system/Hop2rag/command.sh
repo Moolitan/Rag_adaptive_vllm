@@ -28,6 +28,14 @@ python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
             --monitor-interval 0.5 \
             --max-hops 10
 
+# 纯净版hop2rag测试（并发版）
+python tests/rag_system/Hop2rag/test_hop2rag_performance_concurrent.py \
+    --limit 10 \
+    --k 10 \
+    --max-workers 4 \
+    --monitor-interval 0.05  \
+    --max-hops 10  
+
 # 结束 profiling（关键）
 nsys sessions list
 nsys stop --session=profile-<>
