@@ -25,8 +25,9 @@ python tests/rag_system/c_rag/test_crag_on_squad_dev.py \
   --monitor-interval 0.5 \
   --verbose
 #push到github上
- git push -u origin self_rag性能测试分析
-
+git push -u origin self_rag性能测试分析
+#推送不了时，使用这个命令
+git remote set-url origin https://github.com/Moolitan/Rag_adaptive_vllm.git
 
 # 前台运行faiss数据库服务,注意目录位置
 cd /home/wjj/Rag_adaptive_vllm
