@@ -16,12 +16,15 @@ monitor = DataCollector()
 
 def get_performance_records():
     """获取性能监控记录"""
-    return monitor.records
+    return monitor.get_records()
+
+def get_performance_summary():
+    """获取性能统计摘要"""
+    return monitor.get_summary()
 
 def clear_performance_records():
     """清空性能监控记录"""
-    monitor.records.clear()
-    monitor.starts.clear()
+    monitor.clear()
 
 
 # =============================
@@ -137,20 +140,24 @@ Question: {question}
 
 Answer:"""
 
-# 文档评分提示词
-DOC_GRADER_PROMPT = """You are a grader assessing relevance of a retrieved document to a user question.
+# 文档评分提示词（批量版本）
+DOC_GRADER_PROMPT = """You are a grader assessing relevance of multiple retrieved documents to a user question.
 
 A document is relevant if it contains ANY information that could help answer the question,
 including partial information, background context, or related entities mentioned in the question.
 
 Be LENIENT: If the document mentions any person, place, or concept from the question, mark it as relevant.
 
-Document:
-{document}
+Documents to evaluate:
+{documents}
 
 Question: {question}
 
-Return JSON {{"score": "yes" or "no"}}. Use "yes" if the document is even partially relevant."""
+Return a JSON object with a single key "scores" containing an array of "yes" or "no" values,
+one for each document in the same order they were provided.
+Example: {{"scores": ["yes", "no", "yes", "yes", "no"]}}
+
+Use "yes" if the document is even partially relevant."""
 
 # 幻觉检测提示词
 HALLUCINATION_PROMPT = """You are a grader assessing whether an answer is grounded in / supported by a set of facts.
@@ -191,7 +198,38 @@ Return JSON {{"score": "yes" or "no"}}."""
 _retriever = None
 
 
-def get_retriever(debug: bool = False):
+def get_retriever(debug: bool = False, use_remote: bool = True):
+    """
+    获取 retriever 实例
+    
+    Args:
+        debug: 是否开启调试模式
+        use_remote: 是否优先使用远程服务（默认 True）
+    
+    Returns:
+        retriever 实例（远程或本地）
+    """
+    global _retriever
+    
+    # 如果已经初始化过，直接返回缓存的实例
+    if _retriever is not None:
+        return _retriever
+    
+    # 优先尝试连接远程服务
+    if use_remote:
+        try:
+            from Rag.faiss_client import RemoteRetriever
+            remote = RemoteRetriever()
+            if remote.is_available():
+                print("[FAISS] Using remote retriever service")
+                _retriever = remote
+                return _retriever
+            else:
+                print("[FAISS] Remote service not available, falling back to local")
+        except Exception as e:
+            print(f"[FAISS] Failed to connect remote: {e}, falling back to local")
+    
+    # 回退到本地初始化
     import os
     from langchain_community.vectorstores import FAISS
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -200,6 +238,7 @@ def get_retriever(debug: bool = False):
     if not faiss_dir:
         raise RuntimeError("Please set AGRAG_FAISS_DIR")
 
+    print("[FAISS] Loading local database...")
     embedding = HuggingFaceEmbeddings(
         model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
         model_kwargs={"device": "cuda"},
@@ -211,6 +250,7 @@ def get_retriever(debug: bool = False):
         embedding,
         allow_dangerous_deserialization=True,
     )
+    print("[FAISS] Local database loaded")
 
     retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
 
@@ -224,10 +264,25 @@ def get_retriever(debug: bool = False):
                 print(d.page_content[:200])
                 print(d.metadata)
             return docs
-
         retriever.get_relevant_documents = _debug_get_docs  # monkey patch
 
-    return retriever
+    # 缓存实例
+    _retriever = retriever
+    return _retriever
+
+
+def init_retriever(debug: bool = False, use_remote: bool = True):
+    """
+    显式预初始化 retriever
+    
+    Args:
+        debug: 调试模式
+        use_remote: 是否使用远程服务
+    
+    Returns:
+        初始化后的 retriever 实例
+    """
+    return get_retriever(debug=debug, use_remote=use_remote)
 
 
 
@@ -277,10 +332,10 @@ def get_rag_chain():
 
 
 def get_doc_grader():
-    """获取文档评分器"""
+    """获取文档评分器（批量版本）"""
     global _doc_grader
     if _doc_grader is None:
-        prompt = PromptTemplate(template=DOC_GRADER_PROMPT, input_variables=["question", "document"])
+        prompt = PromptTemplate(template=DOC_GRADER_PROMPT, input_variables=["question", "documents"])
         _doc_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
     return _doc_grader
 
@@ -326,20 +381,38 @@ def retrieve_node(state: CRagState) -> Dict[str, Any]:
 
 
 def grade_documents_node(state: CRagState) -> Dict[str, Any]:
-    """文档评分节点：评估每个文档的相关性"""
+    """文档评分节点：批量评估所有文档的相关性（单次LLM调用）"""
     docs = state.get("documents", [])
+    
+    if not docs:
+        return {"document_scores": []}
+    
     grader = get_doc_grader()
-
-    scores = []
-    for d in docs:
-        score = grader.invoke({
-            "question": state["question"],
-            "document": d.page_content
-        })
-        scores.append({
-            "document": d,
-            "score": score.get("score", "no")
-        })
+    
+    # 构建带编号的文档列表字符串
+    docs_text = "\n\n".join([
+        f"[Document {i+1}]:\n{d.page_content[:1000]}"  # 限制每个文档长度避免超出上下文
+        for i, d in enumerate(docs)
+    ])
+    
+    # 单次调用LLM评估所有文档
+    result = grader.invoke({
+        "question": state["question"],
+        "documents": docs_text
+    })
+    
+    # 解析批量评分结果
+    score_list = result.get("scores", [])
+    
+    # 如果返回的分数数量不匹配，用 "no" 填充或截断
+    while len(score_list) < len(docs):
+        score_list.append("no")
+    score_list = score_list[:len(docs)]
+    
+    scores = [
+        {"document": d, "score": score_list[i]}
+        for i, d in enumerate(docs)
+    ]
 
     return {"document_scores": scores}
 
