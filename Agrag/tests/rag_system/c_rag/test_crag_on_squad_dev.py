@@ -1,13 +1,6 @@
 """
 CRag Performance & QA Evaluation Script (FAISS + SQuAD)
-
-- Corrective RAG (CRag)
-- Vector Store: FAISS (AGRAG_FAISS_DIR)
-- QA Dataset: SQuAD dev.json
-- Metrics:
-    - Performance: latency / LLM calls / tokens / web search
-    - Quality: EM / F1
-- Monitoring: VLLMMonitor + DataCollector
+Hop2Rag-style instrumentation with DataCollector
 """
 
 import argparse
@@ -76,8 +69,8 @@ def normalize_answer(s: str) -> str:
     return " ".join(s.split())
 
 
-def exact_match(pred: str, gt: str) -> bool:
-    return normalize_answer(pred) == normalize_answer(gt)
+def exact_match(pred: str, gt: str) -> int:
+    return int(normalize_answer(pred) == normalize_answer(gt))
 
 
 def f1_score(pred: str, gt: str) -> float:
@@ -100,19 +93,20 @@ class PerformanceResult:
     question: str
     answer: str
 
-    em: bool
+    em: int
     f1: float
 
     total_latency_sec: float
 
-    llm_calls: int
-    total_llm_latency_sec: float
-    total_input_tokens: int
-    total_output_tokens: int
+    total_nodes: int
+    llm_nodes: int
+    retriever_nodes: int
+    cpu_nodes: int
 
-    node_executions: int
+    total_llm_latency_sec: float
+    total_retriever_latency_sec: float
+
     used_web_search: bool
-    web_search_rounds: int
 
     records: List[Dict[str, Any]]
 
@@ -132,12 +126,19 @@ def run_single_test(sample: Dict[str, Any]) -> PerformanceResult:
 
     records = get_performance_records()
 
-    llm_records = [r for r in records if r.get("event") == "llm_call"]
-    node_records = [r for r in records if r.get("event") == "node_execution"]
+    # ---- Hop2Rag-style classification ----
+    llm_nodes = [r for r in records if r.get("node_type") == "llm"]
+    retriever_nodes = [r for r in records if r.get("node_type") == "retriever"]
+    cpu_nodes = [r for r in records if r.get("node_type") == "cpu"]
+
+    total_llm_latency = sum(r.get("llm_latency", 0) for r in llm_nodes)
+    total_retriever_latency = sum(
+        r.get("retriever_latency", 0) for r in retriever_nodes
+    )
 
     pred = result.get("answer", "")
 
-    em = max((exact_match(pred, a) for a in answers), default=False)
+    em = max((exact_match(pred, a) for a in answers), default=0)
     f1 = max((f1_score(pred, a) for a in answers), default=0.0)
 
     metadata = result.get("metadata", {})
@@ -147,18 +148,17 @@ def run_single_test(sample: Dict[str, Any]) -> PerformanceResult:
         answer=pred,
         em=em,
         f1=f1,
-
         total_latency_sec=total_latency,
 
-        llm_calls=len(llm_records),
-        total_llm_latency_sec=sum(r.get("latency", 0) for r in llm_records),
-        total_input_tokens=sum(r.get("input_tokens", 0) for r in llm_records),
-        total_output_tokens=sum(r.get("output_tokens", 0) for r in llm_records),
+        total_nodes=len(records),
+        llm_nodes=len(llm_nodes),
+        retriever_nodes=len(retriever_nodes),
+        cpu_nodes=len(cpu_nodes),
 
-        node_executions=len(node_records),
+        total_llm_latency_sec=total_llm_latency,
+        total_retriever_latency_sec=total_retriever_latency,
+
         used_web_search=bool(metadata.get("used_web_search", False)),
-        web_search_rounds=int(metadata.get("web_search_rounds", 0)),
-
         records=list(records),
     )
 
@@ -179,8 +179,7 @@ def run_benchmark(samples: List[Dict[str, Any]], verbose: bool):
             print(
                 f"  EM={perf.em} | F1={perf.f1:.3f} | "
                 f"Latency={perf.total_latency_sec:.2f}s | "
-                f"LLM={perf.llm_calls} | "
-                f"Web={perf.used_web_search}"
+                f"LLM={perf.llm_nodes} | Ret={perf.retriever_nodes}"
             )
 
     return results
@@ -202,35 +201,25 @@ def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
         "latency_p95": float(np.percentile(
             [r.total_latency_sec for r in results], 95)),
 
-        "llm_calls_mean": float(np.mean([r.llm_calls for r in results])),
-        "input_tokens_mean": float(np.mean([r.total_input_tokens for r in results])),
-        "output_tokens_mean": float(np.mean([r.total_output_tokens for r in results])),
+        "llm_latency_mean": float(np.mean(
+            [r.total_llm_latency_sec for r in results])),
+
+        "retriever_latency_mean": float(np.mean(
+            [r.total_retriever_latency_sec for r in results])),
+
+        "llm_nodes_mean": float(np.mean([r.llm_nodes for r in results])),
+        "retriever_nodes_mean": float(np.mean([r.retriever_nodes for r in results])),
 
         "web_search_rate": float(np.mean([r.used_web_search for r in results])),
     }
-
-# =============================
-# Save results
-# =============================
-
-def save_results(results, stats, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(out_dir / "performance_results.json", "w", encoding="utf-8") as f:
-        json.dump([asdict(r) for r in results], f, indent=2, ensure_ascii=False)
-
-    with open(out_dir / "performance_stats.json", "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
-
-    print(f"\nResults saved to: {out_dir}")
 
 # =============================
 # Main
 # =============================
 
 def main():
-    ap = argparse.ArgumentParser("CRag Performance Test (FAISS + SQuAD)")
-    ap.add_argument("--squad-dev", type=str, help="Path to SQuAD dev.json")
+    ap = argparse.ArgumentParser("CRag Performance Test (Hop2Rag-style)")
+    ap.add_argument("--squad-dev", type=str)
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--monitor-interval", type=float, default=0.5)
@@ -242,18 +231,13 @@ def main():
         sys.exit(1)
 
     if args.squad_dev:
-        all_samples = load_squad_dev(Path(args.squad_dev))
-        samples = all_samples[args.start: args.start + args.limit]
+        samples = load_squad_dev(Path(args.squad_dev))
+        samples = samples[args.start: args.start + args.limit]
     else:
         samples = [{
             "question": "Which city is the capital of China?",
             "answers": ["Beijing"]
         }]
-
-    print("=" * 60)
-    print("CRag Performance & QA Evaluation")
-    print("=" * 60)
-    print(f"Questions: {len(samples)}\n")
 
     monitor = VLLMMonitor(
         url="http://localhost:8000/metrics",
@@ -269,11 +253,15 @@ def main():
     finally:
         monitor.stop()
 
-    print("\nStatistics")
     for k, v in stats.items():
-        print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+        print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
-    save_results(results, stats, RESULTS_DIR)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(RESULTS_DIR / "performance_results.json", "w") as f:
+        json.dump([asdict(r) for r in results], f, indent=2)
+
+    with open(RESULTS_DIR / "performance_stats.json", "w") as f:
+        json.dump(stats, f, indent=2)
 
 
 if __name__ == "__main__":
