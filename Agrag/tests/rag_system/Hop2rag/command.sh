@@ -28,12 +28,20 @@ python tests/rag_system/Hop2rag/test_hop2rag_performance.py \
             --monitor-interval 0.5 \
             --max-hops 10
 
+# - bridge：桥接型问题（5918个） - 需要通过中间实体连接到最终答案                                 
+# - 例如："Who is the director of the movie that won Best Picture at the 2020 Oscars?"          
+# - 需要先找到"哪部电影获奖" → 再找"该电影的导演是谁"                                           
+# - comparison：比较型问题（1487个） - 需要比较两个实体的某个属性                                 
+# - 例如："Were Scott Derrickson and Ed Wood of the same nationality?"                          
+# - 需要分别查找两个人的国籍，然后比较 
 # 纯净版hop2rag测试（并发版）
 python tests/rag_system/Hop2rag/test_hop2rag_performance_concurrent.py \
-    --limit 10 \
+    --limit 100 \
     --k 10 \
-    --max-workers 4 \
-    --monitor-interval 0.05  \
+    --max-workers 250 \
+    --question-type bridge \
+    --monitor-interval 0.5  \
+    --level hard \
     --max-hops 10  
 
 # 结束 profiling（关键）
@@ -55,6 +63,13 @@ python tests/rag_system/Hop2rag/analyze_prompt_distribution.py \
 python tests/rag_system/Hop2rag/plot_prefix_cache_hitrate.py \
     --input tests/results/hop2rag_performance/vllm_metrics.csv \
     --output tests/results/hop2rag_performance/plots/prefix_cache_hitrate.png 
+
+
+# 画并发测试的性能指标图
+python tests/rag_system/Hop2rag/plot_concurrent_metrics.py \
+    --results-dir tests/results/hop2rag_performance_concurrent \
+    --limit 100 \
+    --output tests/results/hop2rag_performance_concurrent/plots 
 
 # 画nsys profile采样的图
 python tests/rag_system/Hop2rag/plot_gpu_execution.py 

@@ -401,11 +401,15 @@ class VLLMMonitor:
 
         # 1) 统一打印(尽量稳定、简洁)
         gpu_pct = float(current.get("gpu_cache", 0.0)) * 100.0
+        # 从 derived 中获取计算好的吞吐量
+        prompt_tput = float(derived.get("prompt_toks_per_s", 0.0))
+        gen_tput = float(derived.get("gen_toks_per_s", 0.0))
         log = (
             f"[{now}] "
             f"ΔP:{int(deltas['prompt'])} | ΔG:{int(deltas['gen'])} | "
             f"Run:{int(current.get('running', 0))} Wait:{int(current.get('waiting', 0))} | "
-            f"KV:{gpu_pct:.1f}%"
+            f"KV:{gpu_pct:.1f}% | "
+            f"PromptTput:{prompt_tput:.0f} GenTput:{gen_tput:.0f}"
         )
         if notes:
             log += " | " + " ".join(notes)

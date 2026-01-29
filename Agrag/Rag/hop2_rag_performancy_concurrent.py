@@ -289,8 +289,27 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from threading import Lock
 
+# 全局单例 Embedding 模型
+_embedding_model = None
+_embedding_lock = Lock()
+
+# Retriever 缓存
 _custom_retrievers = {}
 _retriever_lock = Lock()
+
+
+def get_embedding_model():
+    """获取全局单例 Embedding 模型（线程安全）"""
+    global _embedding_model
+    with _embedding_lock:
+        if _embedding_model is None:
+            print("[INFO] Loading embedding model (first time)...")
+            _embedding_model = HuggingFaceEmbeddings(
+                model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
+                encode_kwargs={'normalize_embeddings': True},
+            )
+            print("[INFO] Embedding model loaded successfully!")
+        return _embedding_model
 
 
 def get_custom_retriever(persist_dir: str, collection_name: str, k: int = 10):
@@ -305,10 +324,8 @@ def get_custom_retriever(persist_dir: str, collection_name: str, k: int = 10):
             if not collection_name:
                 raise ValueError("collection_name is required")
 
-            embedding = HuggingFaceEmbeddings(
-                model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
-                encode_kwargs={'normalize_embeddings': True},
-            )
+            # 使用全局单例 embedding 模型
+            embedding = get_embedding_model()
 
             vectorstore = Chroma(
                 collection_name=collection_name,
@@ -316,6 +333,7 @@ def get_custom_retriever(persist_dir: str, collection_name: str, k: int = 10):
                 embedding_function=embedding,
             )
             _custom_retrievers[cache_key] = vectorstore.as_retriever(search_kwargs={"k": k})
+            print(f"[INFO] Created retriever for cache_key: {cache_key}")
 
         return _custom_retrievers[cache_key]
 
@@ -688,6 +706,68 @@ def get_hop2_rag_app():
 # =============================
 # 便捷调用接口（并发版本）
 # =============================
+
+def warmup_resources(
+    persist_dir: str,
+    collection_name: str = "hotpot_fullwiki",
+    k: int = 10
+):
+    """
+    预热资源：在并发测试开始前加载所有必要的资源
+
+    Args:
+        persist_dir: 向量库路径
+        collection_name: 集合名称
+        k: 检索 K 值
+    """
+    print("\n" + "=" * 70)
+    print("Warming up resources...")
+    print("=" * 70)
+
+    import time
+    start_time = time.time()
+
+    # 1. 预加载 Embedding 模型
+    print("[1/4] Loading embedding model...")
+    embedding_start = time.time()
+    _ = get_embedding_model()
+    embedding_time = time.time() - embedding_start
+    print(f"      Embedding model loaded in {embedding_time:.2f}s")
+
+    # 2. 预加载 LLM 链
+    print("[2/4] Loading LLM chains...")
+    llm_start = time.time()
+    _ = get_question_decomposer()
+    _ = get_clue_extractor()
+    _ = get_hop_decision_chain()
+    _ = get_multi_hop_rag_chain()
+    llm_time = time.time() - llm_start
+    print(f"      LLM chains loaded in {llm_time:.2f}s")
+
+    # 3. 预创建 Retriever
+    print("[3/4] Creating retriever...")
+    retriever_start = time.time()
+    retriever = get_custom_retriever(persist_dir, collection_name, k)
+    retriever_time = time.time() - retriever_start
+    print(f"      Retriever created in {retriever_time:.2f}s")
+
+    # 4. 预热向量数据库（执行实际检索操作）
+    print("[4/4] Warming up vector database...")
+    db_start = time.time()
+    try:
+        # 执行一次实际检索，触发向量数据库加载索引到内存
+        _ = retriever.invoke("warmup query")
+        db_time = time.time() - db_start
+        print(f"      Vector database warmed up in {db_time:.2f}s")
+    except Exception as e:
+        db_time = time.time() - db_start
+        print(f"      Vector database warmup failed in {db_time:.2f}s: {e}")
+
+    total_time = time.time() - start_time
+    print("=" * 70)
+    print(f"Warmup complete! Total time: {total_time:.2f}s")
+    print("=" * 70 + "\n")
+
 
 def run_hop2_rag_with_collector(
     question: str,

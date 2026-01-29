@@ -23,12 +23,13 @@ from runner.VLLMMonitor import VLLMMonitor
 from runner.LanggraphMonitor import DataCollector
 
 # 导入 Hop2Rag 相关函数（但不使用全局 monitor）
-from Rag.hop2_rag_performancy_concurrent import run_hop2_rag_with_collector
+from Rag.hop2_rag_performancy_concurrent import run_hop2_rag_with_collector, warmup_resources
 
 PERSIST_DIR = os.environ.get("AGRAG_PERSIST_DIR", "")
 COLLECTION_NAME = os.environ.get("AGRAG_COLLECTION_NAME", "hotpot_fullwiki")
 
 RESULTS_DIR = ROOT / "tests" / "results" / "hop2rag_performance_concurrent"
+HOTPOTQA_DATA_PATH = ROOT / "data" / "hotpotqa" / "hotpot_dev_fullwiki_v1.json"
 
 
 @dataclass
@@ -250,23 +251,25 @@ def save_results(
     results: List[PerformanceResult],
     stats: Dict[str, Any],
     llm_calls: List[Dict[str, Any]],
-    output_dir: Path
+    output_dir: Path,
+    limit: int = None,
+    max_workers: int = None
 ):
     """保存结果"""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存详细结果
-    results_file = output_dir / "performance_results.json"
+    results_file = output_dir / f"performance_results_l{limit}_c{max_workers}.json"
     with open(results_file, 'w', encoding='utf-8') as f:
         json.dump([asdict(r) for r in results], f, ensure_ascii=False, indent=2)
 
     # 保存统计
-    stats_file = output_dir / "performance_stats.json"
+    stats_file = output_dir / f"performance_stats_l{limit}_c{max_workers}.json"
     with open(stats_file, 'w', encoding='utf-8') as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
     # 保存 LLM calls 和 prompt token 分布
-    llm_calls_file = output_dir / "llm_calls.json"
+    llm_calls_file = output_dir / f"llm_calls_l{limit}_c{max_workers}.json"
     token_counts = [call.get("prompt_tokens", 0) for call in llm_calls if call.get("prompt_tokens", 0) > 0]
 
     llm_data = {
@@ -286,9 +289,9 @@ def save_results(
         json.dump(llm_data, f, ensure_ascii=False, indent=2)
 
     print(f"\nResults saved to: {output_dir}")
-    print(f"  - performance_results.json: {len(results)} requests")
-    print(f"  - performance_stats.json: aggregated statistics")
-    print(f"  - llm_calls.json: {len(llm_calls)} LLM calls")
+    print(f"  - performance_results_l{limit}_c{max_workers}.json: {len(results)} requests")
+    print(f"  - performance_stats_l{limit}_c{max_workers}.json: aggregated statistics")
+    print(f"  - llm_calls_l{limit}_c{max_workers}.json: {len(llm_calls)} LLM calls")
     if token_counts:
         print(f"    Token distribution: min={min(token_counts)}, max={max(token_counts)}, mean={sum(token_counts)/len(token_counts):.1f}")
 
@@ -338,6 +341,57 @@ def print_summary(stats: Dict[str, Any]):
     print(f"  Max:    {stats.get('hops_max', 0)}")
 
 
+def load_hotpotqa_questions(
+    data_path: Path,
+    limit: int = None,
+    question_type: str = None,
+    level: str = None
+) -> List[str]:
+    """
+    从 HotpotQA 数据集加载问题
+
+    Args:
+        data_path: JSON 数据文件路径
+        limit: 限制加载的问题数量
+        question_type: 过滤问题类型 ("bridge", "comparison", None=all)
+        level: 过滤难度级别 ("easy", "medium", "hard", None=all)
+
+    Returns:
+        问题列表
+    """
+    if not data_path.exists():
+        raise FileNotFoundError(f"HotpotQA data file not found: {data_path}")
+
+    print(f"\nLoading questions from: {data_path}")
+
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    print(f"  Total questions in dataset: {len(data)}")
+
+    # 过滤
+    filtered_data = data
+    if question_type:
+        filtered_data = [item for item in filtered_data if item.get("type") == question_type]
+        print(f"  After type filter ({question_type}): {len(filtered_data)}")
+
+    if level:
+        filtered_data = [item for item in filtered_data if item.get("level") == level]
+        print(f"  After level filter ({level}): {len(filtered_data)}")
+
+    # 提取问题
+    questions = [item["question"] for item in filtered_data]
+
+    # 限制数量
+    if limit and limit < len(questions):
+        questions = questions[:limit]
+        print(f"  Limited to: {len(questions)} questions")
+    else:
+        print(f"  Using: {len(questions)} questions")
+
+    return questions
+
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -345,7 +399,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例用法:
-  # 基本用法（4 个并发线程）
+  # 基本用法（从 HotpotQA 加载数据）
   python test_hop2rag_performance_concurrent.py \\
       --limit 20 \\
       --max-workers 4
@@ -356,61 +410,97 @@ def main():
       --max-workers 16 \\
       --monitor-interval 0.05
 
-  # 低并发功能测试
+  # 只测试 bridge 类型问题
   python test_hop2rag_performance_concurrent.py \\
-      --limit 10 \\
-      --max-workers 2 \\
-      --verbose
+      --limit 50 \\
+      --max-workers 4 \\
+      --question-type bridge
+
+  # 只测试 hard 难度问题
+  python test_hop2rag_performance_concurrent.py \\
+      --limit 30 \\
+      --max-workers 4 \\
+      --level hard
         """
     )
 
-    ap.add_argument("--limit", type=int, default=10, help="Number of questions")
+    ap.add_argument("--limit", type=int, default=10, help="Number of questions to test")
     ap.add_argument("--k", type=int, default=10, help="Retrieval K")
     ap.add_argument("--max-hops", type=int, default=3, help="Max hops")
     ap.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers (threads)")
     ap.add_argument("--monitor-interval", type=float, default=0.5, help="VLLMMonitor polling interval")
     ap.add_argument("--verbose", action="store_true", help="Verbose output")
+    ap.add_argument("--question-type", type=str, choices=["bridge", "comparison"], help="Filter by question type")
+    ap.add_argument("--level", type=str, choices=["easy", "medium", "hard"], help="Filter by difficulty level")
+    ap.add_argument("--use-sample-questions", action="store_true", help="Use hardcoded sample questions instead of loading from file")
     args = ap.parse_args()
 
     if not PERSIST_DIR:
         print("[ERROR] Set AGRAG_PERSIST_DIR environment variable")
         sys.exit(1)
 
-    # 示例问题
-    questions = [
-        "Were Scott Derrickson and Ed Wood of the same nationality?",
-        "What government position was held by the woman who portrayed Corliss Archer in the film Kiss and Tell?",
-        "What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?",
-        "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?",
-        "The director of the romantic comedy \"Big Stone Gap\" is based in what New York city?",
-        "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
-        "Who was known by his stage name Aladin and helped organizations improve their performance as a consultant?",
-        "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
-        "Who is older, Annie Morton or Terry Richardson?",
-        "Are Local H and For Against both from the United States?",
-        "What is the name of the fight song of the university whose main campus is in Lawrence, Kansas and whose branch campuses are in the Kansas City metropolitan area?",
-        "What screenwriter with credits for \"Evolution\" co-wrote a film starring Nicolas Cage and Téa Leoni?",
-        "What year did Guns N Roses perform a promo for a movie starring Arnold Schwarzenegger as a former New York Police detective?",
-        "Are Random House Tower and 888 7th Avenue both used for real estate?",
-        "The football manager who recruited David Beckham managed Manchester United during what timeframe?",
-        "Brown State Fishing Lake is in a country that has a population of how many inhabitants?",
-    ]
-    questions = questions[:min(args.limit, len(questions))]
+    # 加载问题
+    if args.use_sample_questions:
+        # 使用示例问题（向后兼容）
+        questions = [
+            "Were Scott Derrickson and Ed Wood of the same nationality?",
+            "What government position was held by the woman who portrayed Corliss Archer in the film Kiss and Tell?",
+            "What science fantasy young adult series, told in first person, has a set of companion books narrating the stories of enslaved worlds and alien species?",
+            "Are the Laleli Mosque and Esma Sultan Mansion located in the same neighborhood?",
+            "The director of the romantic comedy \"Big Stone Gap\" is based in what New York city?",
+            "2014 S/S is the debut album of a South Korean boy group that was formed by who?",
+            "Who was known by his stage name Aladin and helped organizations improve their performance as a consultant?",
+            "The arena where the Lewiston Maineiacs played their home games can seat how many people?",
+            "Who is older, Annie Morton or Terry Richardson?",
+            "Are Local H and For Against both from the United States?",
+            "What is the name of the fight song of the university whose main campus is in Lawrence, Kansas and whose branch campuses are in the Kansas City metropolitan area?",
+            "What screenwriter with credits for \"Evolution\" co-wrote a film starring Nicolas Cage and Téa Leoni?",
+            "What year did Guns N Roses perform a promo for a movie starring Arnold Schwarzenegger as a former New York Police detective?",
+            "Are Random House Tower and 888 7th Avenue both used for real estate?",
+            "The football manager who recruited David Beckham managed Manchester United during what timeframe?",
+            "Brown State Fishing Lake is in a country that has a population of how many inhabitants?",
+        ]
+        questions = questions[:min(args.limit, len(questions))]
+        print(f"\nUsing {len(questions)} sample questions")
+    else:
+        # 从 HotpotQA 数据集加载
+        try:
+            questions = load_hotpotqa_questions(
+                data_path=HOTPOTQA_DATA_PATH,
+                limit=args.limit,
+                question_type=args.question_type,
+                level=args.level
+            )
+        except FileNotFoundError as e:
+            print(f"\n[ERROR] {e}")
+            print("Use --use-sample-questions to use hardcoded questions instead")
+            sys.exit(1)
 
-    print("=" * 70)
+    print("\n" + "=" * 70)
     print("Hop2Rag Performance Test - Concurrent Version")
     print("=" * 70)
     print(f"Questions: {len(questions)}")
     print(f"K: {args.k}, Max Hops: {args.max_hops}")
     print(f"Max Workers: {args.max_workers}")
     print(f"Monitor Interval: {args.monitor_interval}s")
+    if args.question_type:
+        print(f"Question Type Filter: {args.question_type}")
+    if args.level:
+        print(f"Difficulty Level Filter: {args.level}")
     print()
+
+    # 预热资源（在主线程中加载所有必要的资源）
+    warmup_resources(
+        persist_dir=PERSIST_DIR,
+        collection_name=COLLECTION_NAME,
+        k=args.k
+    )
 
     # 启动 VLLMMonitor
     monitor = VLLMMonitor(
         url="http://localhost:8000/metrics",
         interval=args.monitor_interval,
-        csv_path=RESULTS_DIR / "vllm_metrics_concurrent.csv",
+        csv_path=RESULTS_DIR / f"vllm_metrics_concurrent_l{args.limit}_c{args.max_workers}.csv",
         flush_every=1
     )
     monitor.start()
@@ -433,20 +523,9 @@ def main():
     print_summary(stats)
 
     # 保存结果
-    save_results(results, stats, all_llm_calls, RESULTS_DIR)
+    save_results(results, stats, all_llm_calls, RESULTS_DIR, args.limit, args.max_workers)
 
-    print("\n" + "=" * 70)
-    print("Next Steps")
-    print("=" * 70)
-    print("\n1. 分析 prompt token 分布:")
-    print(f"   python Agrag/tests/rag_system/Hop2rag/analyze_prompt_distribution.py \\")
-    print(f"       --input {RESULTS_DIR}/llm_calls.json \\")
-    print(f"       --output {RESULTS_DIR}/plots/prompt_dist \\")
-    print(f"       --suggest-threshold")
-    print("\n2. 绘制 prefix cache 命中率图:")
-    print(f"   python Agrag/tests/rag_system/Hop2rag/plot_prefix_cache_hitrate.py \\")
-    print(f"       --input {RESULTS_DIR}/vllm_metrics.csv \\")
-    print(f"       --output {RESULTS_DIR}/plots/prefix_cache_hitrate.png")
+
 
 
 if __name__ == "__main__":
