@@ -8,6 +8,5 @@ Agrag/data/hotpotqa/
 Agrag/data/wiki/
 Agrag/Ai_coding.sh
 Agrag/tests/results/*.jsonl
-Agrag/tests/results/*.json
-Agrag/.langgraph_api/
 Agrag/tests/results/
+Agrag/.langgraph_api/
