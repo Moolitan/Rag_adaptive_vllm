@@ -36,3 +36,15 @@ AGRAG_FAISS_DIR="/mnt/Large_Language_Model_Lab_1/faiss_wiki_db" python -m Agrag.
 nohup env AGRAG_FAISS_DIR="/mnt/Large_Language_Model_Lab_1/faiss_wiki_db" -m Agrag.Rag.faiss_server > faiss_server.log 2>&1 &
 #检查faiss数据库服务状态
 curl http://127.0.0.1:5100/health
+
+#并发crag测试，问题数目20，4个并发线程
+python tests/rag_system/c_rag/test_c_rag_performance_concurrent.py \
+  --limit 20 \
+  --max-workers 4 \
+  --monitor-interval 0.5
+#不包含不可能的问题
+python tests/rag_system/c_rag/test_c_rag_performance_concurrent.py \
+  --limit 20 \
+  --max-workers 4 \
+  --monitor-interval 0.5 \
+  --include-impossible

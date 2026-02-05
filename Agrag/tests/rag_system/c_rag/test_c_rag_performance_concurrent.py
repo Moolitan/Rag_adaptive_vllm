@@ -1,0 +1,491 @@
+"""
+CRag Performance Test - Concurrent Version
+
+使用 ThreadPoolExecutor 实现并发测试，每个线程独立的 DataCollector
+数据集: SQUAD-dev-v2.0.json
+向量库: FAISS
+"""
+
+import argparse
+import sys
+import os
+import json
+import time
+from pathlib import Path
+from typing import List, Dict, Any
+from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+
+from runner.VLLMMonitor import VLLMMonitor
+from runner.LanggraphMonitor import DataCollector
+
+# 导入 CRag 相关函数
+from Rag.c_rag_performancy_concurrent import run_c_rag_with_collector, warmup_resources
+
+RESULTS_DIR = ROOT / "tests" / "results" / "crag_performance_concurrent"
+SQUAD_DATA_PATH = Path(__file__).parent / "data" / "SQUAD-dev-v2.0.json"
+
+
+@dataclass
+class PerformanceResult:
+    """单次请求的性能结果"""
+    worker_id: int
+    question: str
+    answer: str
+    total_latency_sec: float
+    # 节点统计
+    total_nodes: int
+    llm_nodes: int
+    retriever_nodes: int
+    cpu_nodes: int
+    # 延迟统计
+    total_llm_latency_sec: float
+    total_retriever_latency_sec: float
+    # 时间戳
+    start_timestamp: float
+    end_timestamp: float
+    # 元数据
+    metadata: Dict[str, Any]
+    # 详细记录
+    records: List[Dict[str, Any]]
+    llm_calls: List[Dict[str, Any]]
+
+
+def run_single_test_concurrent(
+    question: str,
+    worker_id: int
+) -> PerformanceResult:
+    """
+    并发环境下运行单个问题测试
+
+    每个线程使用独立的 DataCollector，避免线程安全问题
+    """
+    # 创建线程独立的 collector
+    collector = DataCollector(
+        debug=False,
+        track_prompts=True,
+        encoding_name="cl100k_base"
+    )
+
+    start_time = time.time()
+    start_timestamp = start_time
+
+    # 运行 CRag（传入独立的 collector）
+    result = run_c_rag_with_collector(
+        question=question,
+        collector=collector
+    )
+
+    end_time = time.time()
+    total_latency = end_time - start_time
+
+    # 从 collector 获取记录
+    records = collector.get_records()
+    llm_calls = collector.get_llm_calls()
+
+    # 按节点类型分类
+    llm_nodes = [r for r in records if r.get("node_type") == "llm"]
+    retriever_nodes = [r for r in records if r.get("node_type") == "retriever"]
+    cpu_nodes = [r for r in records if r.get("node_type") == "cpu"]
+
+    # 计算延迟
+    total_llm_latency = sum(r.get("llm_latency", 0) for r in llm_nodes)
+    total_retriever_latency = sum(r.get("retriever_latency", 0) for r in retriever_nodes)
+
+    return PerformanceResult(
+        worker_id=worker_id,
+        question=question,
+        answer=result.get("answer", ""),
+        total_latency_sec=total_latency,
+        total_nodes=len(records),
+        llm_nodes=len(llm_nodes),
+        retriever_nodes=len(retriever_nodes),
+        cpu_nodes=len(cpu_nodes),
+        total_llm_latency_sec=total_llm_latency,
+        total_retriever_latency_sec=total_retriever_latency,
+        start_timestamp=start_timestamp,
+        end_timestamp=end_time,
+        metadata=result.get("metadata", {}),
+        records=list(records),
+        llm_calls=list(llm_calls)
+    )
+
+
+def run_benchmark_concurrent(
+    questions: List[str],
+    max_workers: int = 4,
+    verbose: bool = True
+) -> tuple[List[PerformanceResult], List[Dict[str, Any]]]:
+    """
+    并发运行批量测试
+
+    Args:
+        questions: 问题列表
+        max_workers: 最大并发线程数
+        verbose: 是否打印详细信息
+
+    Returns:
+        (results, all_llm_calls): 性能结果列表和所有 LLM call 记录
+    """
+    results = []
+    all_llm_calls = []
+    completed_count = 0
+    total_count = len(questions)
+    lock = Lock()
+
+    print(f"\n启动并发测试 (max_workers={max_workers})")
+    print(f"   总问题数: {total_count}")
+    print()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_info = {
+            executor.submit(run_single_test_concurrent, q, i): (i, q)
+            for i, q in enumerate(questions)
+        }
+
+        # 按完成顺序收集结果
+        for future in as_completed(future_to_info):
+            worker_id, question = future_to_info[future]
+
+            with lock:
+                completed_count += 1
+                current_count = completed_count
+
+            try:
+                result = future.result()
+
+                with lock:
+                    results.append(result)
+                    all_llm_calls.extend(result.llm_calls)
+
+                if verbose:
+                    print(f"[{current_count}/{total_count}] Worker {worker_id}: {question[:50]}...")
+                    print(f"  Latency: {result.total_latency_sec:.2f}s, "
+                          f"Nodes: {result.total_nodes} "
+                          f"(LLM:{result.llm_nodes}, Ret:{result.retriever_nodes}, CPU:{result.cpu_nodes}), "
+                          f"LLM time: {result.total_llm_latency_sec:.2f}s")
+
+            except Exception as e:
+                print(f"[{current_count}/{total_count}] Worker {worker_id}: Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # 按时间戳排序（恢复时间顺序）
+    results.sort(key=lambda x: x.start_timestamp)
+    all_llm_calls.sort(key=lambda x: x.get("timestamp", 0))
+
+    return results, all_llm_calls
+
+
+def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
+    """计算统计数据"""
+    if not results:
+        return {}
+
+    latencies = [r.total_latency_sec for r in results]
+    llm_latencies = [r.total_llm_latency_sec for r in results]
+    retriever_latencies = [r.total_retriever_latency_sec for r in results]
+    llm_nodes = [r.llm_nodes for r in results]
+    retriever_nodes = [r.retriever_nodes for r in results]
+    cpu_nodes = [r.cpu_nodes for r in results]
+    total_nodes = [r.total_nodes for r in results]
+
+    # 计算时间跨度（用于计算吞吐量）
+    start_times = [r.start_timestamp for r in results]
+    end_times = [r.end_timestamp for r in results]
+    total_duration = max(end_times) - min(start_times) if start_times and end_times else 0
+    throughput = len(results) / total_duration if total_duration > 0 else 0
+
+    return {
+        "total_requests": len(results),
+        "total_duration_sec": float(total_duration),
+        "throughput_qps": float(throughput),
+        "latency_mean": float(np.mean(latencies)),
+        "latency_median": float(np.median(latencies)),
+        "latency_std": float(np.std(latencies)),
+        "latency_p50": float(np.percentile(latencies, 50)),
+        "latency_p90": float(np.percentile(latencies, 90)),
+        "latency_p95": float(np.percentile(latencies, 95)),
+        "latency_p99": float(np.percentile(latencies, 99)),
+        "latency_min": float(np.min(latencies)),
+        "latency_max": float(np.max(latencies)),
+        "llm_latency_mean": float(np.mean(llm_latencies)),
+        "llm_latency_median": float(np.median(llm_latencies)),
+        "llm_latency_total": float(np.sum(llm_latencies)),
+        "retriever_latency_mean": float(np.mean(retriever_latencies)),
+        "retriever_latency_median": float(np.median(retriever_latencies)),
+        "retriever_latency_total": float(np.sum(retriever_latencies)),
+        "total_nodes_mean": float(np.mean(total_nodes)),
+        "llm_nodes_mean": float(np.mean(llm_nodes)),
+        "llm_nodes_total": int(np.sum(llm_nodes)),
+        "retriever_nodes_mean": float(np.mean(retriever_nodes)),
+        "retriever_nodes_total": int(np.sum(retriever_nodes)),
+        "cpu_nodes_mean": float(np.mean(cpu_nodes)),
+        "cpu_nodes_total": int(np.sum(cpu_nodes)),
+    }
+
+
+def save_results(
+    results: List[PerformanceResult],
+    stats: Dict[str, Any],
+    llm_calls: List[Dict[str, Any]],
+    output_dir: Path,
+    limit: int = None,
+    max_workers: int = None
+):
+    """保存结果"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存详细结果
+    results_file = output_dir / f"performance_results_l{limit}_c{max_workers}.json"
+    with open(results_file, 'w', encoding='utf-8') as f:
+        json.dump([asdict(r) for r in results], f, ensure_ascii=False, indent=2)
+
+    # 保存统计
+    stats_file = output_dir / f"performance_stats_l{limit}_c{max_workers}.json"
+    with open(stats_file, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    # 保存 LLM calls 和 prompt token 分布
+    llm_calls_file = output_dir / f"llm_calls_l{limit}_c{max_workers}.json"
+    token_counts = [call.get("prompt_tokens", 0) for call in llm_calls if call.get("prompt_tokens", 0) > 0]
+
+    llm_data = {
+        "llm_calls": llm_calls,
+        "distribution": {
+            "total_calls": len(llm_calls),
+            "total_tokens": sum(token_counts),
+            "min_tokens": min(token_counts) if token_counts else 0,
+            "max_tokens": max(token_counts) if token_counts else 0,
+            "mean_tokens": sum(token_counts) / len(token_counts) if token_counts else 0,
+            "median_tokens": sorted(token_counts)[len(token_counts) // 2] if token_counts else 0,
+            "token_counts": token_counts,
+        }
+    }
+
+    with open(llm_calls_file, 'w', encoding='utf-8') as f:
+        json.dump(llm_data, f, ensure_ascii=False, indent=2)
+
+    print(f"\nResults saved to: {output_dir}")
+    print(f"  - performance_results_l{limit}_c{max_workers}.json: {len(results)} requests")
+    print(f"  - performance_stats_l{limit}_c{max_workers}.json: aggregated statistics")
+    print(f"  - llm_calls_l{limit}_c{max_workers}.json: {len(llm_calls)} LLM calls")
+    if token_counts:
+        print(f"    Token distribution: min={min(token_counts)}, max={max(token_counts)}, mean={sum(token_counts)/len(token_counts):.1f}")
+
+
+def print_summary(stats: Dict[str, Any]):
+    """打印性能摘要"""
+    print("\n" + "=" * 70)
+    print("Performance Summary")
+    print("=" * 70)
+
+    print("\n[Overall]")
+    print(f"  Total Requests: {stats.get('total_requests', 0)}")
+    print(f"  Total Duration: {stats.get('total_duration_sec', 0):.2f}s")
+    print(f"  Throughput: {stats.get('throughput_qps', 0):.2f} QPS")
+
+    print("\n[Latency (seconds)]")
+    print(f"  Mean:   {stats.get('latency_mean', 0):.2f}s")
+    print(f"  Median: {stats.get('latency_median', 0):.2f}s")
+    print(f"  Std:    {stats.get('latency_std', 0):.2f}s")
+    print(f"  P50:    {stats.get('latency_p50', 0):.2f}s")
+    print(f"  P90:    {stats.get('latency_p90', 0):.2f}s")
+    print(f"  P95:    {stats.get('latency_p95', 0):.2f}s")
+    print(f"  P99:    {stats.get('latency_p99', 0):.2f}s")
+    print(f"  Min:    {stats.get('latency_min', 0):.2f}s")
+    print(f"  Max:    {stats.get('latency_max', 0):.2f}s")
+
+    print("\n[LLM Latency]")
+    print(f"  Mean:   {stats.get('llm_latency_mean', 0):.2f}s")
+    print(f"  Median: {stats.get('llm_latency_median', 0):.2f}s")
+    print(f"  Total:  {stats.get('llm_latency_total', 0):.2f}s")
+
+    print("\n[Retriever Latency]")
+    print(f"  Mean:   {stats.get('retriever_latency_mean', 0):.2f}s")
+    print(f"  Median: {stats.get('retriever_latency_median', 0):.2f}s")
+    print(f"  Total:  {stats.get('retriever_latency_total', 0):.2f}s")
+
+    print("\n[Nodes]")
+    print(f"  Total Nodes (mean):     {stats.get('total_nodes_mean', 0):.1f}")
+    print(f"  LLM Nodes (mean):       {stats.get('llm_nodes_mean', 0):.1f} (total: {stats.get('llm_nodes_total', 0)})")
+    print(f"  Retriever Nodes (mean): {stats.get('retriever_nodes_mean', 0):.1f} (total: {stats.get('retriever_nodes_total', 0)})")
+    print(f"  CPU Nodes (mean):       {stats.get('cpu_nodes_mean', 0):.1f} (total: {stats.get('cpu_nodes_total', 0)})")
+
+
+def load_squad_questions(
+    data_path: Path,
+    limit: int = None,
+    skip_impossible: bool = True
+) -> List[str]:
+    """
+    从 SQUAD 数据集加载问题
+
+    Args:
+        data_path: JSON 数据文件路径
+        limit: 限制加载的问题数量
+        skip_impossible: 是否跳过不可能回答的问题
+
+    Returns:
+        问题列表
+    """
+    if not data_path.exists():
+        raise FileNotFoundError(f"SQUAD data file not found: {data_path}")
+
+    print(f"\nLoading questions from: {data_path}")
+
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # SQUAD 数据集结构: {"version": "...", "data": [{title, paragraphs: [{qas: [{question, ...}]}]}]}
+    questions = []
+    total_qas = 0
+    skipped_impossible = 0
+
+    for article in data.get("data", []):
+        for paragraph in article.get("paragraphs", []):
+            for qa in paragraph.get("qas", []):
+                total_qas += 1
+                # 跳过不可能回答的问题
+                if skip_impossible and qa.get("is_impossible", False):
+                    skipped_impossible += 1
+                    continue
+                question = qa.get("question", "").strip()
+                if question:
+                    questions.append(question)
+
+    print(f"  Total QA pairs in dataset: {total_qas}")
+    if skip_impossible:
+        print(f"  Skipped impossible questions: {skipped_impossible}")
+    print(f"  Available questions: {len(questions)}")
+
+    # 限制数量
+    if limit and limit < len(questions):
+        questions = questions[:limit]
+        print(f"  Limited to: {len(questions)} questions")
+    else:
+        print(f"  Using: {len(questions)} questions")
+
+    return questions
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="CRag Performance Test - Concurrent Version",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例用法:
+  # 基本用法（从 SQUAD 加载数据）
+  python test_c_rag_performance_concurrent.py \\
+      --limit 20 \\
+      --max-workers 4
+
+  # 高并发压力测试
+  python test_c_rag_performance_concurrent.py \\
+      --limit 100 \\
+      --max-workers 16 \\
+      --monitor-interval 0.05
+
+  # 使用示例问题
+  python test_c_rag_performance_concurrent.py \\
+      --limit 10 \\
+      --max-workers 4 \\
+      --use-sample-questions
+        """
+    )
+
+    ap.add_argument("--limit", type=int, default=10, help="Number of questions to test")
+    ap.add_argument("--max-workers", type=int, default=4, help="Max concurrent workers (threads)")
+    ap.add_argument("--monitor-interval", type=float, default=0.5, help="VLLMMonitor polling interval")
+    ap.add_argument("--verbose", action="store_true", help="Verbose output")
+    ap.add_argument("--include-impossible", action="store_true", help="Include impossible questions from SQUAD")
+    ap.add_argument("--use-sample-questions", action="store_true", help="Use hardcoded sample questions instead of loading from file")
+    ap.add_argument("--use-remote", action="store_true", default=True, help="Use remote FAISS service")
+    args = ap.parse_args()
+
+    # 加载问题
+    if args.use_sample_questions:
+        # 使用示例问题
+        questions = [
+            "In what country is Normandy located?",
+            "When were the Normans in Normandy?",
+            "Who was the Norse leader?",
+            "What century did the Normans first gain their separate identity?",
+            "Who was the duke in the battle of Hastings?",
+            "What religion were the Normans?",
+            "What is the original meaning of the word Norman?",
+            "When was the Duchy of Normandy founded?",
+            "What was the name of the count of Apulia?",
+            "Where did the Normans and Byzantines sign the peace treaty?",
+            "What is the capital of France?",
+            "Who wrote Romeo and Juliet?",
+            "What is the speed of light?",
+            "Who discovered gravity?",
+            "What is the largest planet in our solar system?",
+            "What year did World War II end?",
+        ]
+        questions = questions[:min(args.limit, len(questions))]
+        print(f"\nUsing {len(questions)} sample questions")
+    else:
+        # 从 SQUAD 数据集加载
+        try:
+            questions = load_squad_questions(
+                data_path=SQUAD_DATA_PATH,
+                limit=args.limit,
+                skip_impossible=not args.include_impossible
+            )
+        except FileNotFoundError as e:
+            print(f"\n[ERROR] {e}")
+            print("Use --use-sample-questions to use hardcoded questions instead")
+            sys.exit(1)
+
+    print("\n" + "=" * 70)
+    print("CRag Performance Test - Concurrent Version")
+    print("=" * 70)
+    print(f"Questions: {len(questions)}")
+    print(f"Max Workers: {args.max_workers}")
+    print(f"Monitor Interval: {args.monitor_interval}s")
+    print(f"Use Remote FAISS: {args.use_remote}")
+    print()
+
+    # 预热资源（在主线程中加载所有必要的资源）
+    warmup_resources(use_remote=args.use_remote)
+
+    # 启动 VLLMMonitor
+    monitor = VLLMMonitor(
+        url="http://localhost:8000/metrics",
+        interval=args.monitor_interval,
+        csv_path=RESULTS_DIR / f"vllm_metrics_concurrent_l{args.limit}_c{args.max_workers}.csv",
+        flush_every=1
+    )
+    monitor.start()
+
+    try:
+        # 运行并发测试
+        results, all_llm_calls = run_benchmark_concurrent(
+            questions,
+            args.max_workers,
+            args.verbose
+        )
+        stats = compute_stats(results)
+
+    finally:
+        monitor.stop()
+
+    # 打印性能摘要
+    print_summary(stats)
+
+    # 保存结果
+    save_results(results, stats, all_llm_calls, RESULTS_DIR, args.limit, args.max_workers)
+
+
+
+
+if __name__ == "__main__":
+    main()

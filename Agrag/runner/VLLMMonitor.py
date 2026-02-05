@@ -208,7 +208,7 @@ class MetricSpec:
 class VLLMMonitor:
     def __init__(
         self,
-        url: str = "http://localhost:8000/metrics",
+        url: str = "http://localhost:6000/metrics",
         interval: float = 0.5,
         csv_path: str = "vllm_benchmark.csv",
         flush_every: int = 1,
@@ -513,7 +513,7 @@ class VLLMMonitor:
 
 if __name__ == "__main__":
     mon = VLLMMonitor(
-        url="http://localhost:8000/metrics",
+        url="http://localhost:6000/metrics",
         interval=0.5,
         csv_path="vllm_benchmark.csv",
         flush_every=1,

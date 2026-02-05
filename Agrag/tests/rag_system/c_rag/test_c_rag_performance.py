@@ -32,7 +32,10 @@ from runner.VLLMMonitor import VLLMMonitor
 
 from Rag.c_rag_performancy import (
     run_c_rag,
+    get_llm_calls,
+    get_prompt_token_distribution,
     get_performance_records,
+    get_performance_summary,
     clear_performance_records,
 )
 
@@ -67,6 +70,7 @@ class PerformanceResult:
     web_search_rounds: int
 
     records: List[Dict[str, Any]]
+    llm_call_details: List[Dict[str, Any]]  # 每个 LLM call 的 prompt 和 response
 
 
 # =============================
@@ -81,14 +85,22 @@ def run_single_test(question: str) -> PerformanceResult:
     result = run_c_rag(question)
     total_latency = time.time() - start
 
+    # 获取节点级别的执行记录
     records = get_performance_records()
+    # 获取 LLM call 的详细记录（包含 prompt 和 response）
+    llm_call_details = get_llm_calls()
+    # 获取性能摘要
+    summary = get_performance_summary()
 
-    llm_records = [r for r in records if r.get("event") == "llm_call"]
+    # 从节点记录中筛选
     node_records = [r for r in records if r.get("event") == "node_execution"]
 
-    total_llm_latency = sum(r.get("latency", 0) for r in llm_records)
-    total_input_tokens = sum(r.get("input_tokens", 0) for r in llm_records)
-    total_output_tokens = sum(r.get("output_tokens", 0) for r in llm_records)
+    # 从 llm_call_details 计算 token 统计
+    total_input_tokens = sum(call.get("prompt_tokens", 0) for call in llm_call_details)
+    total_output_tokens = sum(call.get("response_tokens", 0) for call in llm_call_details)
+
+    # 从 summary 获取 LLM 延迟
+    total_llm_latency = summary.get("llm_latency_sec", 0)
 
     metadata = result.get("metadata", {})
 
@@ -98,7 +110,7 @@ def run_single_test(question: str) -> PerformanceResult:
 
         total_latency_sec=total_latency,
 
-        llm_calls=len(llm_records),
+        llm_calls=len(llm_call_details),
         total_llm_latency_sec=total_llm_latency,
         total_input_tokens=total_input_tokens,
         total_output_tokens=total_output_tokens,
@@ -107,7 +119,8 @@ def run_single_test(question: str) -> PerformanceResult:
         used_web_search=bool(metadata.get("used_web_search", False)),
         web_search_rounds=int(metadata.get("web_search_rounds", 0)),
 
-        records=list(records)
+        records=list(records),
+        llm_call_details=llm_call_details
     )
 
 

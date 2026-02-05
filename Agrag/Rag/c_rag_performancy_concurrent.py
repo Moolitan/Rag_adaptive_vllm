@@ -1,40 +1,19 @@
 """
-CRag - Corrective RAG实现（独立版本）
+CRag - Corrective RAG实现（并发版本）
 流程：LLM判断数据源 → 检索 → 文档评分过滤 → 生成 → 质量检查 → 重试机制
-不依赖工厂模式，所有组件独立实现
+
+支持传入独立的 DataCollector，用于并发测试场景
+使用线程安全的单例模式管理资源
 """
 from typing import TypedDict, List, Dict, Any
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langgraph.graph import StateGraph, START, END
+from threading import Lock
 
-from runner.LanggraphMonitor_llmcall import DataCollector
+from runner.LanggraphMonitor import DataCollector
 
-# 全局性能监控器实例
-# monitor = DataCollector()
-
-monitor = DataCollector(track_prompts=True, encoding_name="cl100k_base")
-
-def get_performance_records():
-    """获取性能监控记录"""
-    return monitor.get_records()
-
-def get_llm_calls():
-    """获取 LLM call 记录"""
-    return monitor.get_llm_calls()
-
-def get_prompt_token_distribution():
-    """获取 prompt token 分布统计"""
-    return monitor.get_prompt_token_distribution()
-
-def get_performance_summary():
-    """获取性能统计摘要"""
-    return monitor.get_summary()
-
-def clear_performance_records():
-    """清空性能监控记录"""
-    monitor.clear()
 
 # =============================
 # 状态定义
@@ -79,7 +58,7 @@ class CRagState(TypedDict, total=False):
 from langchain_openai import ChatOpenAI
 
 VLLM_MODEL_NAME = "Qwen2.5"
-VLLM_API_BASE = "http://localhost:6000/v1"
+VLLM_API_BASE = "http://localhost:8000/v1"
 VLLM_API_KEY = "EMPTY"
 
 
@@ -201,15 +180,49 @@ Return JSON {{"score": "yes" or "no"}}."""
 
 
 # =============================
-# 向量库配置（延迟导入）
+# 线程安全的资源管理（并发版本）
 # =============================
 
+# 全局单例 Embedding 模型（线程安全）
+_embedding_model = None
+_embedding_lock = Lock()
+
+# Retriever 缓存（线程安全）
 _retriever = None
+_retriever_lock = Lock()
+
+# LLM 链缓存（线程安全）
+_router_chain = None
+_rag_chain = None
+_doc_grader = None
+_hallucination_grader = None
+_answer_grader = None
+_chain_lock = Lock()
+
+# Web搜索工具（线程安全）
+_web_search_tool = None
+_web_search_lock = Lock()
+
+
+def get_embedding_model():
+    """获取全局单例 Embedding 模型（线程安全）"""
+    global _embedding_model
+    with _embedding_lock:
+        if _embedding_model is None:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            print("[INFO] Loading embedding model (first time)...")
+            _embedding_model = HuggingFaceEmbeddings(
+                model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
+                model_kwargs={"device": "cuda"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+            print("[INFO] Embedding model loaded successfully!")
+        return _embedding_model
 
 
 def get_retriever(debug: bool = False, use_remote: bool = True):
     """
-    获取 retriever 实例
+    获取 retriever 实例（线程安全）
     
     Args:
         debug: 是否开启调试模式
@@ -220,69 +233,66 @@ def get_retriever(debug: bool = False, use_remote: bool = True):
     """
     global _retriever
     
-    # 如果已经初始化过，直接返回缓存的实例
-    if _retriever is not None:
+    with _retriever_lock:
+        # 如果已经初始化过，直接返回缓存的实例
+        if _retriever is not None:
+            return _retriever
+        
+        # 优先尝试连接远程服务
+        if use_remote:
+            try:
+                from Rag.faiss_client import RemoteRetriever
+                remote = RemoteRetriever()
+                if remote.is_available():
+                    print("[FAISS] Using remote retriever service")
+                    _retriever = remote
+                    return _retriever
+                else:
+                    print("[FAISS] Remote service not available, falling back to local")
+            except Exception as e:
+                print(f"[FAISS] Failed to connect remote: {e}, falling back to local")
+        
+        # 回退到本地初始化
+        import os
+        from langchain_community.vectorstores import FAISS
+
+        faiss_dir = os.environ.get("AGRAG_FAISS_DIR")
+        if not faiss_dir:
+            raise RuntimeError("Please set AGRAG_FAISS_DIR")
+
+        print("[FAISS] Loading local database...")
+        # 使用全局单例 embedding 模型
+        embedding = get_embedding_model()
+
+        vectorstore = FAISS.load_local(
+            faiss_dir,
+            embedding,
+            allow_dangerous_deserialization=True,
+        )
+        print("[FAISS] Local database loaded")
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
+
+        if debug:
+            def _debug_get_docs(query: str):
+                docs = retriever.get_relevant_documents(query)
+                print(f"[FAISS] query='{query}'")
+                print(f"[FAISS] retrieved {len(docs)} docs")
+                for i, d in enumerate(docs[:3]):
+                    print(f"--- doc {i} ---")
+                    print(d.page_content[:200])
+                    print(d.metadata)
+                return docs
+            retriever.get_relevant_documents = _debug_get_docs  # monkey patch
+
+        # 缓存实例
+        _retriever = retriever
         return _retriever
-    
-    # 优先尝试连接远程服务
-    if use_remote:
-        try:
-            from Rag.faiss_client import RemoteRetriever
-            remote = RemoteRetriever()
-            if remote.is_available():
-                print("[FAISS] Using remote retriever service")
-                _retriever = remote
-                return _retriever
-            else:
-                print("[FAISS] Remote service not available, falling back to local")
-        except Exception as e:
-            print(f"[FAISS] Failed to connect remote: {e}, falling back to local")
-    
-    # 回退到本地初始化
-    import os
-    from langchain_community.vectorstores import FAISS
-    from langchain_huggingface import HuggingFaceEmbeddings
-
-    faiss_dir = os.environ.get("AGRAG_FAISS_DIR")
-    if not faiss_dir:
-        raise RuntimeError("Please set AGRAG_FAISS_DIR")
-
-    print("[FAISS] Loading local database...")
-    embedding = HuggingFaceEmbeddings(
-        model_name="/mnt/Large_Language_Model_Lab_1/模型/rag_models/BAAI-bge-base-en-v1.5",
-        model_kwargs={"device": "cuda"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-    vectorstore = FAISS.load_local(
-        faiss_dir,
-        embedding,
-        allow_dangerous_deserialization=True,
-    )
-    print("[FAISS] Local database loaded")
-
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
-
-    if debug:
-        def _debug_get_docs(query: str):
-            docs = retriever.get_relevant_documents(query)
-            print(f"[FAISS] query='{query}'")
-            print(f"[FAISS] retrieved {len(docs)} docs")
-            for i, d in enumerate(docs[:3]):
-                print(f"--- doc {i} ---")
-                print(d.page_content[:200])
-                print(d.metadata)
-            return docs
-        retriever.get_relevant_documents = _debug_get_docs  # monkey patch
-
-    # 缓存实例
-    _retriever = retriever
-    return _retriever
 
 
 def init_retriever(debug: bool = False, use_remote: bool = True):
     """
-    显式预初始化 retriever
+    显式预初始化 retriever（线程安全）
     
     Args:
         debug: 调试模式
@@ -294,77 +304,72 @@ def init_retriever(debug: bool = False, use_remote: bool = True):
     return get_retriever(debug=debug, use_remote=use_remote)
 
 
-
 # =============================
-# Web搜索工具
+# Web搜索工具（线程安全）
 # =============================
-
-_web_search_tool = None
-
 
 def get_web_search_tool():
-    """获取web搜索工具"""
+    """获取web搜索工具（线程安全）"""
     global _web_search_tool
-    if _web_search_tool is None:
-        from langchain_tavily import TavilySearch
-        _web_search_tool = TavilySearch(max_results=5)
-    return _web_search_tool
+    with _web_search_lock:
+        if _web_search_tool is None:
+            from langchain_tavily import TavilySearch
+            _web_search_tool = TavilySearch(max_results=5)
+        return _web_search_tool
 
 
 # =============================
-# 链构建
+# 链构建（线程安全）
 # =============================
-
-_router_chain = None
-_rag_chain = None
-_doc_grader = None
-_hallucination_grader = None
-_answer_grader = None
-
 
 def get_router_chain():
-    """获取路由链"""
+    """获取路由链（线程安全）"""
     global _router_chain
-    if _router_chain is None:
-        prompt = PromptTemplate(template=ROUTER_PROMPT, input_variables=["question"])
-        _router_chain = prompt | get_llm(json_mode=True) | JsonOutputParser()
-    return _router_chain
+    with _chain_lock:
+        if _router_chain is None:
+            prompt = PromptTemplate(template=ROUTER_PROMPT, input_variables=["question"])
+            _router_chain = prompt | get_llm(json_mode=True) | JsonOutputParser()
+        return _router_chain
 
 
 def get_rag_chain():
-    """获取RAG生成链"""
+    """获取RAG生成链（线程安全）"""
     global _rag_chain
-    if _rag_chain is None:
-        prompt = PromptTemplate(template=RAG_PROMPT, input_variables=["question", "context"])
-        _rag_chain = prompt | get_llm() | StrOutputParser()
-    return _rag_chain
+    with _chain_lock:
+        if _rag_chain is None:
+            prompt = PromptTemplate(template=RAG_PROMPT, input_variables=["question", "context"])
+            _rag_chain = prompt | get_llm() | StrOutputParser()
+        return _rag_chain
 
 
 def get_doc_grader():
-    """获取文档评分器（批量版本）"""
+    """获取文档评分器（线程安全，批量版本）"""
     global _doc_grader
-    if _doc_grader is None:
-        prompt = PromptTemplate(template=DOC_GRADER_PROMPT, input_variables=["question", "documents"])
-        _doc_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
-    return _doc_grader
+    with _chain_lock:
+        if _doc_grader is None:
+            prompt = PromptTemplate(template=DOC_GRADER_PROMPT, input_variables=["question", "documents"])
+            _doc_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
+        return _doc_grader
 
 
 def get_hallucination_grader():
-    """获取幻觉检测器"""
+    """获取幻觉检测器（线程安全）"""
     global _hallucination_grader
-    if _hallucination_grader is None:
-        prompt = PromptTemplate(template=HALLUCINATION_PROMPT, input_variables=["generation", "documents"])
-        _hallucination_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
-    return _hallucination_grader
+    with _chain_lock:
+        if _hallucination_grader is None:
+            prompt = PromptTemplate(template=HALLUCINATION_PROMPT, input_variables=["generation", "documents"])
+            _hallucination_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
+        return _hallucination_grader
 
 
 def get_answer_grader():
-    """获取答案评分器"""
+    """获取答案评分器（线程安全）"""
     global _answer_grader
-    if _answer_grader is None:
-        prompt = PromptTemplate(template=ANSWER_GRADER_PROMPT, input_variables=["generation", "question"])
-        _answer_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
-    return _answer_grader
+    with _chain_lock:
+        if _answer_grader is None:
+            prompt = PromptTemplate(template=ANSWER_GRADER_PROMPT, input_variables=["generation", "question"])
+            _answer_grader = prompt | get_llm(json_mode=True) | JsonOutputParser()
+        return _answer_grader
 
 
 # =============================
@@ -487,9 +492,6 @@ def generate_node(state: CRagState) -> Dict[str, Any]:
         "question": state["question"],
         "context": context
     })
-    # print("the llm 输出：")
-    # print(result)
-    # print("\n")
     return {"generation": result}
 
 
@@ -629,24 +631,94 @@ def get_c_rag_app():
 
 
 # =============================
-# 便捷调用接口
+# 资源预热（并发版本）
 # =============================
 
-def run_c_rag(question: str) -> Dict[str, Any]:
+def warmup_resources(use_remote: bool = True):
     """
-    运行CRag查询
+    预热资源：在并发测试开始前加载所有必要的资源
+
+    Args:
+        use_remote: 是否使用远程 FAISS 服务
+    """
+    print("\n" + "=" * 70)
+    print("Warming up resources...")
+    print("=" * 70)
+
+    import time
+    start_time = time.time()
+
+    # 1. 预加载 Embedding 模型
+    print("[1/4] Loading embedding model...")
+    embedding_start = time.time()
+    _ = get_embedding_model()
+    embedding_time = time.time() - embedding_start
+    print(f"      Embedding model loaded in {embedding_time:.2f}s")
+
+    # 2. 预加载 Retriever
+    print("[2/4] Loading retriever...")
+    retriever_start = time.time()
+    retriever = get_retriever(debug=False, use_remote=use_remote)
+    retriever_time = time.time() - retriever_start
+    print(f"      Retriever loaded in {retriever_time:.2f}s")
+
+    # 3. 预加载 LLM 链
+    print("[3/4] Loading LLM chains...")
+    llm_start = time.time()
+    _ = get_router_chain()
+    _ = get_rag_chain()
+    _ = get_doc_grader()
+    _ = get_hallucination_grader()
+    _ = get_answer_grader()
+    llm_time = time.time() - llm_start
+    print(f"      LLM chains loaded in {llm_time:.2f}s")
+
+    # 4. 预热向量数据库（执行实际检索操作）
+    print("[4/4] Warming up vector database...")
+    db_start = time.time()
+    try:
+        # 执行一次实际检索，触发向量数据库加载索引到内存
+        _ = retriever.invoke("warmup query")
+        db_time = time.time() - db_start
+        print(f"      Vector database warmed up in {db_time:.2f}s")
+    except Exception as e:
+        db_time = time.time() - db_start
+        print(f"      Vector database warmup failed in {db_time:.2f}s: {e}")
+
+    total_time = time.time() - start_time
+    print("=" * 70)
+    print(f"Warmup complete! Total time: {total_time:.2f}s")
+    print("=" * 70 + "\n")
+
+
+# =============================
+# 便捷调用接口（并发版本）
+# =============================
+
+def run_c_rag_with_collector(
+    question: str,
+    collector: DataCollector = None
+) -> Dict[str, Any]:
+    """
+    运行 CRag（支持传入独立的 DataCollector）
 
     Args:
         question: 用户问题
+        collector: DataCollector 实例（如果为 None，创建临时的）
 
     Returns:
-        包含 final_answer 和 metadata 的字典
+        包含 answer, metadata, documents 的字典
     """
     app = get_c_rag_app()
+
+    # 如果没有提供 collector，创建临时的
+    if collector is None:
+        collector = DataCollector(track_prompts=False)
+
     result = app.invoke(
         {"question": question},
         config={
-            "callbacks": [monitor],
+            "callbacks": [collector],
             "recursion_limit": 100
         }
     )
@@ -658,14 +730,42 @@ def run_c_rag(question: str) -> Dict[str, Any]:
     }
 
 
+def run_c_rag(question: str) -> Dict[str, Any]:
+    """
+    运行CRag查询（兼容旧接口，使用临时 collector）
+
+    Args:
+        question: 用户问题
+
+    Returns:
+        包含 answer, metadata, documents 的字典
+    """
+    return run_c_rag_with_collector(question, collector=None)
+
+
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1:
         q = " ".join(sys.argv[1:])
     else:
         q = "What are the latest developments in AI?"
 
     print(f"Question: {q}")
-    result = run_c_rag(q)
+
+    # 创建独立的 collector
+    collector = DataCollector(track_prompts=True, encoding_name="cl100k_base")
+
+    result = run_c_rag_with_collector(
+        question=q,
+        collector=collector
+    )
+
     print(f"Answer: {result['answer']}")
     print(f"Metadata: {result['metadata']}")
+
+    # 查看 LLM calls
+    llm_calls = collector.get_llm_calls()
+    print(f"\nLLM calls: {len(llm_calls)}")
+    for i, call in enumerate(llm_calls[:3], 1):
+        print(f"  {i}. Node: {call['node_name']}, Tokens: {call['prompt_tokens']}")

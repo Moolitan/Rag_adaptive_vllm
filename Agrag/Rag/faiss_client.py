@@ -16,7 +16,7 @@ from langchain_core.documents import Document
 class RemoteRetriever:
     """远程 FAISS Retriever 客户端"""
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 5100, timeout: int = 30):
+    def __init__(self, host: str = "127.0.0.1", port: int = 5100, timeout: int = 60):
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
         self.search_kwargs = {"k": 15}
