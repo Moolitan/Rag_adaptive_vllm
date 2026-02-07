@@ -31,7 +31,10 @@ from runner.VLLMMonitor import VLLMMonitor
 
 from Rag.c_rag_performancy import (
     run_c_rag,
+    get_llm_calls,
+    get_prompt_token_distribution,
     get_performance_records,
+    get_performance_summary,
     clear_performance_records,
 )
 
@@ -105,10 +108,13 @@ class PerformanceResult:
 
     total_llm_latency_sec: float
     total_retriever_latency_sec: float
+    total_input_tokens: int
+    total_output_tokens: int
 
     used_web_search: bool
 
     records: List[Dict[str, Any]]
+    llm_call_details: List[Dict[str, Any]]  # 每个 LLM call 的 prompt 和 response
 
 # =============================
 # Single test
@@ -124,17 +130,24 @@ def run_single_test(sample: Dict[str, Any]) -> PerformanceResult:
     result = run_c_rag(question)
     total_latency = time.time() - start
 
+    # 获取节点级别的执行记录
     records = get_performance_records()
+    # 获取 LLM call 的详细记录（包含 prompt 和 response）
+    llm_call_details = get_llm_calls()
+    # 获取性能摘要
+    summary = get_performance_summary()
 
     # ---- Hop2Rag-style classification ----
     llm_nodes = [r for r in records if r.get("node_type") == "llm"]
     retriever_nodes = [r for r in records if r.get("node_type") == "retriever"]
     cpu_nodes = [r for r in records if r.get("node_type") == "cpu"]
 
-    total_llm_latency = sum(r.get("llm_latency", 0) for r in llm_nodes)
-    total_retriever_latency = sum(
-        r.get("retriever_latency", 0) for r in retriever_nodes
-    )
+    total_llm_latency = summary.get("llm_latency_sec", 0)
+    total_retriever_latency = summary.get("retriever_latency_sec", 0)
+
+    # 从 llm_call_details 计算 token 统计
+    total_input_tokens = sum(call.get("prompt_tokens", 0) for call in llm_call_details)
+    total_output_tokens = sum(call.get("response_tokens", 0) for call in llm_call_details)
 
     pred = result.get("answer", "")
 
@@ -157,9 +170,12 @@ def run_single_test(sample: Dict[str, Any]) -> PerformanceResult:
 
         total_llm_latency_sec=total_llm_latency,
         total_retriever_latency_sec=total_retriever_latency,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
 
         used_web_search=bool(metadata.get("used_web_search", False)),
         records=list(records),
+        llm_call_details=llm_call_details,
     )
 
 # =============================
@@ -210,6 +226,9 @@ def compute_stats(results: List[PerformanceResult]) -> Dict[str, Any]:
         "llm_nodes_mean": float(np.mean([r.llm_nodes for r in results])),
         "retriever_nodes_mean": float(np.mean([r.retriever_nodes for r in results])),
 
+        "input_tokens_mean": float(np.mean([r.total_input_tokens for r in results])),
+        "output_tokens_mean": float(np.mean([r.total_output_tokens for r in results])),
+
         "web_search_rate": float(np.mean([r.used_web_search for r in results])),
     }
 
@@ -240,7 +259,7 @@ def main():
         }]
 
     monitor = VLLMMonitor(
-        url="http://localhost:8000/metrics",
+        url="http://localhost:6000/metrics",
         interval=args.monitor_interval,
         csv_path=RESULTS_DIR / "vllm_metrics.csv",
         flush_every=1,
